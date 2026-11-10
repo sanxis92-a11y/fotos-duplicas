@@ -89,4 +89,8 @@ class Settings(ctx: Context) {
     var threshold: Int
         get() = sp.getInt("threshold", 12)
         set(v) { sp.edit().putInt("threshold", v).apply() }
+    /** 0..30: más alto = junta más caras como la misma persona. */
+    var peopleSens: Int
+        get() = sp.getInt("peopleSens", 15)
+        set(v) { sp.edit().putInt("peopleSens", v).apply() }
 }

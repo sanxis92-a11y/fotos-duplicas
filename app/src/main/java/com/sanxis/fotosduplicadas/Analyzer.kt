@@ -2,6 +2,9 @@ package com.sanxis.fotosduplicadas
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
@@ -10,8 +13,10 @@ import android.util.Base64
 import androidx.exifinterface.media.ExifInterface
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
 import com.google.mlkit.vision.label.ImageLabeling
 import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
 import org.tensorflow.lite.DataType
@@ -19,6 +24,7 @@ import org.tensorflow.lite.Interpreter
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -105,7 +111,12 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         )
 
         const val MODEL_FILE = "mobile_face_net.tflite"
-        const val SAME_PERSON = 0.50f
+        const val FACE_VERSION = "2"           // sube cuando cambia el cálculo de huellas
+        const val MIN_FACE_SHARPNESS = 8.0
+        /** Plantilla ArcFace 112×112: ojo izq., ojo dcho., nariz, boca izq., boca dcha. (de la imagen). */
+        private val TEMPLATE = floatArrayOf(
+            38.2946f, 51.6963f, 73.5318f, 51.5014f, 56.0252f, 71.7366f, 41.5493f, 92.3655f, 70.7299f, 92.2041f
+        )
         const val MIN_FACES_PER_PERSON = 3
     }
 
@@ -118,6 +129,7 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         FaceDetection.getClient(
             FaceDetectorOptions.Builder()
                 .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
                 .setMinFaceSize(0.06f)
                 .build()
         )
@@ -166,25 +178,12 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
             val bmp = scanner.decodeUpright(p.uri, 1024)
             if (bmp == null) { p.contentDone = true; return }
             val img = InputImage.fromBitmap(bmp, 0)
-            val labels = Tasks.await(labeler.process(img))
+            p.labels = Tasks.await(labeler.process(img))
                 .sortedByDescending { it.confidence }
                 .take(8)
                 .map { it.text }
-            val found = Tasks.await(detector.process(img))
-            val list = ArrayList<FaceInfo>()
-            for (f in found) {
-                val bb = Rect(f.boundingBox)
-                if (!bb.intersect(0, 0, bmp.width, bmp.height)) continue
-                if (bb.width() < 24 || bb.height() < 24) continue
-                val emb = if (interp != null && bb.width() >= 40) embed(bmp, bb) else null
-                list += FaceInfo(
-                    bb.left.toFloat() / bmp.width, bb.top.toFloat() / bmp.height,
-                    bb.right.toFloat() / bmp.width, bb.bottom.toFloat() / bmp.height, emb
-                )
-            }
+            p.faces = detectFaces(p, bmp, img)
             bmp.recycle()
-            p.labels = labels
-            p.faces = list
             p.hasGps = if (locAllowed) readGps(p.uri) else false
             p.gpsChecked = locAllowed
             p.contentDone = true
@@ -193,35 +192,156 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         }
     }
 
+    /** Recalcula solo las caras (cuando mejora el método de reconocimiento). */
+    fun analyzeFaces(p: Photo) {
+        try {
+            val bmp = scanner.decodeUpright(p.uri, 1024) ?: return
+            p.faces = detectFaces(p, bmp, InputImage.fromBitmap(bmp, 0))
+            bmp.recycle()
+        } catch (_: Throwable) { }
+    }
+
+    private fun detectFaces(p: Photo, bmp: Bitmap, img: InputImage): List<FaceInfo> {
+        val found = Tasks.await(detector.process(img))
+        if (found.isEmpty()) return emptyList()
+        var big: Bitmap? = null   // la misma foto a más resolución, para caras pequeñas
+        val list = ArrayList<FaceInfo>()
+        try {
+            for (f in found) {
+                val bb = Rect(f.boundingBox)
+                if (!bb.intersect(0, 0, bmp.width, bmp.height)) continue
+                if (bb.width() < 24 || bb.height() < 24) continue
+                var emb: ByteArray? = null
+                // Solo caras casi de frente: de perfil la huella no es fiable
+                val frontal = abs(f.headEulerAngleY) <= 35f && abs(f.headEulerAngleX) <= 30f
+                if (interp != null && frontal && bb.width() >= 36) {
+                    var src = bmp
+                    var scale = 1f
+                    if (bb.width() < 112) {
+                        if (big == null) big = scanner.decodeUpright(p.uri, 2304)
+                        val b = big
+                        if (b != null && b.width > bmp.width) {
+                            src = b
+                            scale = b.width.toFloat() / bmp.width
+                        }
+                    }
+                    if (bb.width() * scale >= 48f) emb = embed(src, bb, landmarks(f), scale)
+                }
+                list += FaceInfo(
+                    bb.left.toFloat() / bmp.width, bb.top.toFloat() / bmp.height,
+                    bb.right.toFloat() / bmp.width, bb.bottom.toFloat() / bmp.height, emb
+                )
+            }
+        } finally {
+            big?.recycle()
+        }
+        return list
+    }
+
+    /** Ojos, nariz y comisuras, ordenados de izquierda a derecha de la imagen como en la plantilla. */
+    private fun landmarks(f: Face): FloatArray? {
+        val ids = intArrayOf(
+            FaceLandmark.RIGHT_EYE, FaceLandmark.LEFT_EYE, FaceLandmark.NOSE_BASE,
+            FaceLandmark.MOUTH_RIGHT, FaceLandmark.MOUTH_LEFT
+        )
+        val out = FloatArray(10)
+        for ((i, id) in ids.withIndex()) {
+            val pt = f.getLandmark(id)?.position ?: return null
+            out[2 * i] = pt.x
+            out[2 * i + 1] = pt.y
+        }
+        if (out[0] > out[2]) {   // si vienen al revés, se intercambian
+            var t = out[0]; out[0] = out[2]; out[2] = t
+            t = out[1]; out[1] = out[3]; out[3] = t
+            t = out[6]; out[6] = out[8]; out[8] = t
+            t = out[7]; out[7] = out[9]; out[9] = t
+        }
+        return out
+    }
+
+    /** Transformación de semejanza (giro + escala + desplazamiento) por mínimos cuadrados. */
+    private fun similarity(s: FloatArray, d: FloatArray, m: Matrix): Boolean {
+        val n = s.size / 2
+        var sxm = 0f; var sym = 0f; var dxm = 0f; var dym = 0f
+        for (i in 0 until n) { sxm += s[2 * i]; sym += s[2 * i + 1]; dxm += d[2 * i]; dym += d[2 * i + 1] }
+        sxm /= n; sym /= n; dxm /= n; dym /= n
+        var a = 0f; var b = 0f; var ss = 0f
+        for (i in 0 until n) {
+            val x = s[2 * i] - sxm
+            val y = s[2 * i + 1] - sym
+            val u = d[2 * i] - dxm
+            val v = d[2 * i + 1] - dym
+            a += x * u + y * v
+            b += x * v - y * u
+            ss += x * x + y * y
+        }
+        if (ss < 1e-3f) return false
+        val ca = a / ss
+        val cb = b / ss
+        val tx = dxm - (ca * sxm - cb * sym)
+        val ty = dym - (cb * sxm + ca * sym)
+        m.setValues(floatArrayOf(ca, -cb, tx, cb, ca, ty, 0f, 0f, 1f))
+        return true
+    }
+
+    private fun fillInput(buf: ByteBuffer, px: IntArray) {
+        for (c in px) {
+            buf.putFloat((((c shr 16) and 0xFF) - 127.5f) / 128f)
+            buf.putFloat((((c shr 8) and 0xFF) - 127.5f) / 128f)
+            buf.putFloat(((c and 0xFF) - 127.5f) / 128f)
+        }
+    }
+
+    /** Huella de la cara: alineada con la plantilla, sumando la versión en espejo. */
     @Synchronized
-    private fun embed(bmp: Bitmap, bb: Rect): ByteArray? {
+    private fun embed(src: Bitmap, bb: Rect, pts: FloatArray?, scale: Float): ByteArray? {
         val ip = interp ?: return null
         return try {
-            val size = (max(bb.width(), bb.height()) * 1.15f).toInt()
-            val cx = bb.exactCenterX()
-            val cy = bb.exactCenterY()
-            val l = (cx - size / 2f).toInt().coerceIn(0, bmp.width - 1)
-            val t = (cy - size / 2f).toInt().coerceIn(0, bmp.height - 1)
-            val w = min(size, bmp.width - l)
-            val h = min(size, bmp.height - t)
-            if (w < 16 || h < 16) return null
-            val crop = Bitmap.createBitmap(bmp, l, t, w, h)
-            val sc = Bitmap.createScaledBitmap(crop, inW, inH, true)
-            if (crop != sc) crop.recycle()
-            val px = IntArray(inW * inH)
-            sc.getPixels(px, 0, inW, 0, 0, inW, inH)
-            sc.recycle()
-            val input = ByteBuffer.allocateDirect(batch * inW * inH * 3 * 4).order(ByteOrder.nativeOrder())
-            for (c in px) {
-                input.putFloat((((c shr 16) and 0xFF) - 127.5f) / 128f)
-                input.putFloat((((c shr 8) and 0xFF) - 127.5f) / 128f)
-                input.putFloat(((c and 0xFF) - 127.5f) / 128f)
+            val m = Matrix()
+            if (pts != null) {
+                val s = FloatArray(10) { pts[it] * scale }
+                val d = FloatArray(10) { if (it % 2 == 0) TEMPLATE[it] * inW / 112f else TEMPLATE[it] * inH / 112f }
+                if (!similarity(s, d, m)) return null
+            } else {
+                val size = max(bb.width(), bb.height()) * 1.15f * scale
+                val l = bb.exactCenterX() * scale - size / 2f
+                val t = bb.exactCenterY() * scale - size / 2f
+                m.setTranslate(-l, -t)
+                m.postScale(inW / size, inH / size)
             }
-            while (input.hasRemaining()) input.putFloat(0f)
-            input.rewind()
-            val out = Array(batch) { FloatArray(dim) }
-            ip.run(input, out)
-            val v = out[0]
+            val face = Bitmap.createBitmap(inW, inH, Bitmap.Config.ARGB_8888)
+            Canvas(face).drawBitmap(src, m, Paint(Paint.FILTER_BITMAP_FLAG))
+            val px = IntArray(inW * inH)
+            face.getPixels(px, 0, inW, 0, 0, inW, inH)
+            face.recycle()
+
+            // Cara demasiado borrosa: mejor no usarla para comparar
+            val g = IntArray(px.size) { (((px[it] shr 16) and 0xFF) * 299 + ((px[it] shr 8) and 0xFF) * 587 + (px[it] and 0xFF) * 114) / 1000 }
+            if (lapVar(g, inW, inH).first < MIN_FACE_SHARPNESS) return null
+
+            val mirror = IntArray(px.size)
+            for (y in 0 until inH) for (x in 0 until inW) mirror[y * inW + x] = px[y * inW + (inW - 1 - x)]
+
+            val v = FloatArray(dim)
+            if (batch >= 2) {
+                val input = ByteBuffer.allocateDirect(batch * inW * inH * 12).order(ByteOrder.nativeOrder())
+                fillInput(input, px)
+                fillInput(input, mirror)
+                while (input.hasRemaining()) input.putFloat(0f)
+                input.rewind()
+                val out = Array(batch) { FloatArray(dim) }
+                ip.run(input, out)
+                for (k in 0 until dim) v[k] = out[0][k] + out[1][k]
+            } else {
+                for (img in listOf(px, mirror)) {
+                    val input = ByteBuffer.allocateDirect(inW * inH * 12).order(ByteOrder.nativeOrder())
+                    fillInput(input, img)
+                    input.rewind()
+                    val out = Array(1) { FloatArray(dim) }
+                    ip.run(input, out)
+                    for (k in 0 until dim) v[k] += out[0][k]
+                }
+            }
             var n = 0.0
             for (x in v) n += x * x
             val norm = sqrt(n).toFloat().takeIf { it > 0f } ?: return null
@@ -264,24 +384,41 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         return s
     }
 
-    fun people(photos: List<Photo>, names: Map<String, String>): List<Person> {
-        class F(val p: Photo, val f: FaceInfo, val key: String, val v: FloatArray)
+    private class F(val p: Photo, val f: FaceInfo, val key: String, val v: FloatArray)
+
+    private fun centroid(m: List<F>): FloatArray {
+        val c = FloatArray(m[0].v.size)
+        for (x in m) for (k in c.indices) c[k] += x.v[k]
+        normalize(c)
+        return c
+    }
+
+    /**
+     * Agrupa caras en tres pasadas:
+     *  1) asignación al grupo más parecido (empezando por las caras más grandes y nítidas),
+     *  2) fusión de grupos cuyos centros se parecen mucho,
+     *  3) recolocación de caras sueltas en el grupo grande más parecido.
+     * threshold: similitud coseno mínima (más alto = más estricto).
+     */
+    fun people(photos: List<Photo>, names: Map<String, String>, threshold: Float, excluded: Set<String>): List<Person> {
         val faces = ArrayList<F>()
         for (p in photos) p.faces.forEachIndexed { i, f ->
             val e = f.emb
-            if (e != null && (dim == 0 || e.size == dim)) faces += F(p, f, "${p.id}:$i", deq(e))
+            val key = "${p.id}:$i"
+            if (e != null && (dim == 0 || e.size == dim) && key !in excluded) faces += F(p, f, key, deq(e))
         }
         if (faces.isEmpty()) return emptyList()
         val size = faces[0].v.size
         faces.removeAll { it.v.size != size }
         faces.sortByDescending { it.f.area }
 
-        val cents = ArrayList<FloatArray>()
-        val members = ArrayList<MutableList<F>>()
+        // 1) Asignación voraz
+        var cents = ArrayList<FloatArray>()
+        var members = ArrayList<MutableList<F>>()
         for (fc in faces) {
             if (cancel) break
             var best = -1
-            var bs = SAME_PERSON
+            var bs = threshold
             for (c in cents.indices) {
                 val s = dot(cents[c], fc.v)
                 if (s > bs) { bs = s; best = c }
@@ -298,7 +435,49 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
             }
         }
 
-        val raw = members.filter { m -> m.map { it.p.id }.distinct().size >= MIN_FACES_PER_PERSON }.map { m ->
+        // 2) Fusionar grupos (de 2 o más caras) con centros muy parecidos
+        val mergeT = threshold + 0.05f
+        for (round in 0 until 3) {
+            val idx = members.indices.filter { members[it].size >= 2 }
+            if (idx.size < 2) break
+            val parent = IntArray(members.size) { it }
+            fun find(x: Int): Int { var r = x; while (parent[r] != r) r = parent[r]; return r }
+            var merged = false
+            for (a in idx.indices) for (b in a + 1 until idx.size) {
+                val i = idx[a]
+                val j = idx[b]
+                if (dot(cents[i], cents[j]) > mergeT) {
+                    val ri = find(i)
+                    val rj = find(j)
+                    if (ri != rj) { parent[ri] = rj; merged = true }
+                }
+            }
+            if (!merged) break
+            val byRoot = LinkedHashMap<Int, MutableList<F>>()
+            for (i in members.indices) byRoot.getOrPut(find(i)) { mutableListOf() }.addAll(members[i])
+            members = ArrayList(byRoot.values)
+            cents = ArrayList(members.map { centroid(it) })
+        }
+
+        // 3) Caras de grupos pequeños: al grupo grande más parecido, si se parece lo suficiente
+        val isBig = BooleanArray(members.size) { i -> members[i].map { it.p.id }.distinct().size >= MIN_FACES_PER_PERSON }
+        val bigIdx = members.indices.filter { isBig[it] }
+        if (bigIdx.isNotEmpty()) {
+            for (i in members.indices) if (!isBig[i]) {
+                for (fc in members[i]) {
+                    var best = -1
+                    var bs = threshold
+                    for (j in bigIdx) {
+                        val s = dot(cents[j], fc.v)
+                        if (s > bs) { bs = s; best = j }
+                    }
+                    if (best >= 0) members[best] += fc
+                }
+            }
+        }
+
+        val raw = bigIdx.map { i ->
+            val m = members[i]
             val keys = m.map { it.key }
             val name = keys.firstNotNullOfOrNull { names[it] } ?: ""
             Person(keys, name, m.map { it.p to it.f })
@@ -328,11 +507,11 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         return m
     }
 
-    fun applyCache(p: Photo, s: List<String>?): Boolean {
-        if (s == null) return false
+    /** 0 = no sirve · 1 = completa · 2 = sirve salvo las caras (calculadas con un método anterior). */
+    fun applyCache(p: Photo, s: List<String>?): Int {
+        if (s == null) return 0
         return try {
-            if (s[1].toLong() != p.modified) return false
-            if (interp != null && s[3] != "1") return false   // analizada sin modelo de caras: repetir
+            if (s[1].toLong() != p.modified) return 0
             p.hasGps = s[2] == "1"
             p.gpsChecked = s[2] != "?"
             p.labels = if (s[4].isEmpty()) emptyList() else s[4].split(',')
@@ -344,13 +523,13 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                 )
             }
             p.contentDone = true
-            true
-        } catch (_: Exception) { false }
+            if (interp != null && s[3] != FACE_VERSION) 2 else 1
+        } catch (_: Exception) { 0 }
     }
 
     @Synchronized
     fun saveCache(photos: List<Photo>, old: Map<Long, List<String>>) {
-        val model = if (interp != null) "1" else "0"
+        val model = if (interp != null) FACE_VERSION else "0"
         try {
             val done = HashSet<Long>()
             for (p in photos) if (p.contentDone) done.add(p.id)

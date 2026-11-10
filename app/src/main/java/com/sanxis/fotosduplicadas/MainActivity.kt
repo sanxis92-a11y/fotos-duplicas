@@ -1136,15 +1136,19 @@ class MainActivity : Activity() {
                 tv("Agrupar por persona no está disponible en esta versión (falta el modelo de caras). Lo demás funciona.", 13f, cSub),
                 lp(MATCH, WRAP).apply { topMargin = dp(6) }
             )
-            people.isEmpty() -> box.addView(
-                tv("Todavía no hay suficientes caras repetidas para formar personas.", 13f, cSub),
-                lp(MATCH, WRAP).apply { topMargin = dp(6) }
-            )
+            people.isEmpty() -> {
+                box.addView(
+                    tv("Todavía no hay suficientes caras repetidas para formar personas. Prueba a mover el control hacia «Juntar más».", 13f, cSub),
+                    lp(MATCH, WRAP).apply { topMargin = dp(6) }
+                )
+                box.addView(peopleTuner(), lp(MATCH, WRAP).apply { topMargin = dp(10) })
+            }
             else -> {
                 box.addView(
                     tv("Toca para ver sus fotos · mantén pulsado para ponerle nombre. Dos personas con el mismo nombre se unen.", 12f, cSub),
                     lp(MATCH, WRAP).apply { topMargin = dp(4) }
                 )
+                box.addView(peopleTuner(), lp(MATCH, WRAP).apply { topMargin = dp(10) })
                 val strip = row().apply { gravity = Gravity.TOP }
                 people.take(80).forEachIndexed { i, pr -> strip.addView(personView(pr, i)) }
                 box.addView(HorizontalScrollView(this).apply {
@@ -1256,7 +1260,7 @@ class MainActivity : Activity() {
         }, lp(WRAP, WRAP).apply { topMargin = dp(6) })
         col.addView(tv("${pr.photos.size} fotos", 11f, cSub))
         loadFace(pr, iv)
-        ring.setOnClickListener { showGrid("👤  $name", pr.photos) }
+        ring.setOnClickListener { showGrid("👤  $name", pr.photos, pr) }
         ring.setOnLongClickListener { renamePerson(pr); true }
         return col
     }
@@ -1326,11 +1330,76 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /** Control para ajustar cuánto se parecen dos caras para ser la misma persona. */
+    private fun peopleTuner(): View {
+        val c = card()
+        val r = row()
+        r.addView(tv("Agrupar caras", 15f, cText, medium = true), LinearLayout.LayoutParams(0, WRAP, 1f))
+        val value = tv("", 13f, cAccent, medium = true)
+        r.addView(value)
+        c.addView(r)
+        fun label(v: Int) = when {
+            v <= 8 -> "Muy estricto"
+            v <= 13 -> "Estricto"
+            v <= 18 -> "Normal"
+            v <= 23 -> "Flexible"
+            else -> "Muy flexible"
+        }
+        val bar = SeekBar(this).apply {
+            max = 30
+            progress = settings.peopleSens.coerceIn(0, 30)
+            progressTintList = csl(cAccent)
+            thumbTintList = csl(cAccent)
+            progressBackgroundTintList = csl(cLine)
+        }
+        value.text = label(bar.progress)
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, v: Int, fromUser: Boolean) { value.text = label(v) }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                settings.peopleSens = bar.progress
+                toast("Reagrupando caras…")
+                regroupPeople()
+            }
+        })
+        c.addView(bar, lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        val hints = row()
+        hints.addView(tv("Separar más", 12f, cSub), LinearLayout.LayoutParams(0, WRAP, 1f))
+        hints.addView(tv("Juntar más", 12f, cSub))
+        c.addView(hints)
+        c.addView(
+            tv("Si una persona sale partida en dos, junta más o ponles el mismo nombre. Si se mezclan personas, separa más o abre la persona, selecciona las fotos que sobran y pulsa «No es».", 12f, cSub).apply {
+                setLineSpacing(0f, 1.15f)
+            },
+            lp(MATCH, WRAP).apply { topMargin = dp(8) }
+        )
+        val n = excludedFaces().size
+        if (n > 0) {
+            c.addView(smallPill("Deshacer correcciones «No es» ($n)") {
+                getSharedPreferences("caras", MODE_PRIVATE).edit().remove("excluidas").apply()
+                regroupPeople()
+            }, lp(WRAP, WRAP).apply { topMargin = dp(10) })
+        }
+        return c
+    }
+
+    /** Similitud mínima entre caras: control a la izquierda = más estricto. */
+    private fun peopleThreshold(): Float = 0.65f - settings.peopleSens.coerceIn(0, 30) * 0.01f
+
+    private fun excludedFaces(): Set<String> =
+        getSharedPreferences("caras", MODE_PRIVATE).getStringSet("excluidas", null)?.toSet() ?: emptySet()
+
+    private fun excludeFaces(keys: Collection<String>) {
+        val cur = excludedFaces().toMutableSet()
+        cur.addAll(keys)
+        getSharedPreferences("caras", MODE_PRIVATE).edit().putStringSet("excluidas", cur).apply()
+    }
+
     private fun regroupPeople() {
         val ps = explorePhotos
         val nm = names()
         Thread {
-            val pp = try { analyzer.people(ps, nm) } catch (_: Throwable) { people }
+            val pp = try { analyzer.people(ps, nm, peopleThreshold(), excludedFaces()) } catch (_: Throwable) { people }
             ui { people = pp; renderExplore() }
         }.start()
     }
@@ -1352,11 +1421,17 @@ class MainActivity : Activity() {
                 val total = photos.size
                 for ((i, p) in photos.withIndex()) {
                     if (analyzer.cancel) break
-                    if (!analyzer.applyCache(p, cache[p.id])) {
-                        analyzer.analyze(p, loc)
-                    } else if (!p.gpsChecked && loc) {
-                        p.hasGps = analyzer.readGps(p.uri)
-                        p.gpsChecked = true
+                    when (analyzer.applyCache(p, cache[p.id])) {
+                        0 -> analyzer.analyze(p, loc)
+                        else -> {
+                            if (cache[p.id]?.getOrNull(3) != ContentAnalyzer.FACE_VERSION && analyzer.hasFaceModel) {
+                                analyzer.analyzeFaces(p)
+                            }
+                            if (!p.gpsChecked && loc) {
+                                p.hasGps = analyzer.readGps(p.uri)
+                                p.gpsChecked = true
+                            }
+                        }
                     }
                     if (i % 10 == 0) {
                         val pct = i * 950 / max(1, total)
@@ -1371,7 +1446,7 @@ class MainActivity : Activity() {
                 val done = photos.filter { it.contentDone }
                 analyzer.cancel = false
                 ui { exProgress?.progress = 960; exSub?.text = "Agrupando caras por persona…" }
-                val pp = analyzer.people(done, names())
+                val pp = analyzer.people(done, names(), peopleThreshold(), excludedFaces())
                 ui {
                     explorePhotos = done
                     people = pp
@@ -1391,7 +1466,7 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- Rejilla de fotos
 
-    private fun showGrid(title: String, photos: List<Photo>) {
+    private fun showGrid(title: String, photos: List<Photo>, person: Person? = null) {
         val g = Group(Kind.BROWSE, photos.toMutableList(), -1L)
         val d = Dialog(
             this,
@@ -1453,7 +1528,7 @@ class MainActivity : Activity() {
         }
         val delBtn = pillButton("", true, cRed) {}
         val gpsBtn = pillButton("📍 Quitar GPS", false, cAccent) {}
-        val cleanBtn = pillButton("🧽 Quitar datos", false, cAccent) {}
+        val cleanBtn = pillButton(if (person != null) "🙅 No es" else "🧽 Quitar datos", false, cAccent) {}
         for (b in listOf(delBtn, gpsBtn, cleanBtn)) {
             b.textSize = 13f
             b.setPadding(dp(6), dp(13), dp(6), dp(13))
@@ -1530,6 +1605,18 @@ class MainActivity : Activity() {
         }
         cleanBtn.setOnClickListener {
             val ps = selected()
+            if (person != null) {
+                // Corrección: estas caras no son de esta persona
+                val ids = ps.map { it.id }.toSet()
+                val keys = person.keys.filterIndexed { i, _ -> person.faces[i].first.id in ids }
+                excludeFaces(keys)
+                g.photos.removeAll { it.id in ids }
+                g.delete.clear()
+                refresh()
+                regroupPeople()
+                toast("Quitadas de esta persona (${ids.size})")
+                return@setOnClickListener
+            }
             AlertDialog.Builder(this)
                 .setTitle("Quitar datos personales")
                 .setMessage(
