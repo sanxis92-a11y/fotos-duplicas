@@ -26,6 +26,11 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - **Metadatos:** ver fecha, cámara, objetivo, exposición, ISO, ubicación, autor… y editar fecha, descripción, autor y copyright (JPEG, PNG, WebP).
 - Las librerías de ML Kit piden Internet para estadísticas; el permiso se elimina del manifiesto, así que la app sigue sin conexión.
 
+## Calculadora secreta (v1.4)
+- Al abrir la app aparece una calculadora que funciona. Escribiendo el código (por defecto `5454+5353`) y pulsando «=» se entra.
+- En Ajustes: cambiar el código, desactivar la calculadora y disfrazar icono y nombre como «Calculadora».
+- Si sales de la app más de 30 segundos, vuelve a pedir el código; la vista previa en recientes se oculta (Android 13+).
+
 ## Borrado
 - Android 11+: van a la **papelera del sistema** (recuperables 30 días) y Android pide confirmación.
 - Android 8–10: borrado definitivo, con aviso previo.

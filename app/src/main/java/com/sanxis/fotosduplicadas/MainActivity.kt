@@ -66,6 +66,8 @@ class MainActivity : Activity() {
         const val REQ_PERM = 1
         const val REQ_TRASH = 2
         const val REQ_WRITE = 3
+        const val EXTRA_UNLOCKED = "desbloqueada"
+        private const val RELOCK_MS = 30_000L
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
     }
@@ -127,6 +129,8 @@ class MainActivity : Activity() {
     @Volatile private var exploring = false
     private var page = 0
     private var pendingWrite: (() -> Unit)? = null
+    private var lastStop = 0L
+    private var awaitingResult = false
     private var gridListener: ((Set<Long>) -> Unit)? = null
     private val faceCache = object : LruCache<String, Bitmap>(8 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
@@ -237,8 +241,13 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        initPalette()
         settings = Settings(this)
+        if (settings.lockEnabled && !intent.getBooleanExtra(EXTRA_UNLOCKED, false)) {
+            lockNow()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(!settings.lockEnabled)
+        initPalette()
         scanner = Scanner(contentResolver, filesDir)
 
         val root = LinearLayout(this).apply {
@@ -333,9 +342,66 @@ class MainActivity : Activity() {
         updateUi()
     }
 
+    override fun onStop() {
+        super.onStop()
+        lastStop = System.currentTimeMillis()
+    }
+
+    override fun onRestart() {
+        super.onRestart()
+        // Al volver tras un rato fuera, se vuelve a pedir el código
+        if (settings.lockEnabled && !awaitingResult && lastStop > 0 &&
+            System.currentTimeMillis() - lastStop > RELOCK_MS
+        ) lockNow()
+    }
+
+    private fun lockNow() {
+        startActivity(
+            Intent(this, CalculatorActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        )
+        finish()
+    }
+
+    /** Cambia el icono y el nombre visibles en el móvil (Calculadora / Fotos Duplicadas). */
+    private fun setLauncherDisguise(calc: Boolean) {
+        val pm = packageManager
+        val on = android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+        val off = android.content.pm.PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+        val flags = android.content.pm.PackageManager.DONT_KILL_APP
+        pm.setComponentEnabledSetting(android.content.ComponentName(this, "$packageName.LauncherCalc"), if (calc) on else off, flags)
+        pm.setComponentEnabledSetting(android.content.ComponentName(this, "$packageName.LauncherPhotos"), if (calc) off else on, flags)
+    }
+
+    private fun changeCode() {
+        val et = EditText(this).apply {
+            hint = "Ej.: 1234×56"
+            setSingleLine()
+        }
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(22), dp(8), dp(22), 0)
+            addView(et)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Nuevo código secreto")
+            .setMessage("Números con al menos una operación (+ − × ÷), mínimo 5 caracteres. Para entrar: escríbelo en la calculadora y pulsa «=».")
+            .setView(wrap)
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Guardar") { _, _ ->
+                val code = Settings.normalizeCode(et.text.toString())
+                if (Settings.isValidCode(code)) {
+                    settings.codeHash = Settings.hashCode(code)
+                    toast("Código cambiado. Úsalo la próxima vez que abras la app.")
+                } else {
+                    toast("Código no válido: usa números y al menos una operación, por ejemplo 1234×56")
+                }
+            }
+            .show()
+    }
+
     override fun onDestroy() {
-        scanner.cancel = true
-        analyzer.cancel = true
+        if (::scanner.isInitialized) scanner.cancel = true
+        if (::analyzer.isInitialized) analyzer.cancel = true
         thumbPool.shutdownNow()
         super.onDestroy()
     }
@@ -1000,6 +1066,15 @@ class MainActivity : Activity() {
         val keepSp = spinner(Settings.KEEP_LABELS, settings.keepRule)
         val camCb = check("Preferir la original de la cámara frente a copias (WhatsApp, descargas…)", settings.preferCamera)
 
+        section("Calculadora secreta")
+        val lockCb = check("Mostrar una calculadora al abrir la app", settings.lockEnabled)
+        val iconCb = check("Icono y nombre de «Calculadora» en el móvil", settings.calcIcon)
+        box.addView(smallPill("🔑  Cambiar código secreto") { changeCode() }, lp(WRAP, WRAP).apply { topMargin = dp(8) })
+        box.addView(
+            tv("Para entrar, escribe el código en la calculadora y pulsa «=». Por defecto: 5454+5353.", 12f, cSub),
+            lp(MATCH, WRAP).apply { topMargin = dp(6) }
+        )
+
         section("Extras")
         val blurCb = check("Buscar también fotos borrosas", settings.blurry)
         box.addView(smallPill("Volver a mostrar los grupos «No son iguales»") {
@@ -1027,6 +1102,15 @@ class MainActivity : Activity() {
                 settings.keepRule = keepSp.selectedItemPosition
                 settings.preferCamera = camCb.isChecked
                 settings.blurry = blurCb.isChecked
+                settings.lockEnabled = lockCb.isChecked
+                if (Build.VERSION.SDK_INT >= 33) setRecentsScreenshotEnabled(!lockCb.isChecked)
+                if (iconCb.isChecked != settings.calcIcon) {
+                    settings.calcIcon = iconCb.isChecked
+                    try {
+                        setLauncherDisguise(iconCb.isChecked)
+                        toast("El icono cambiará en unos segundos")
+                    } catch (_: Exception) { toast("No se pudo cambiar el icono") }
+                }
                 if (!blurCb.isChecked) blurGroups = mutableListOf()
 
                 when {
@@ -1341,7 +1425,7 @@ class MainActivity : Activity() {
         fun label(v: Int) = when {
             v <= 8 -> "Muy estricto"
             v <= 13 -> "Estricto"
-            v <= 18 -> "Normal"
+            v <= 17 -> "Automático"
             v <= 23 -> "Flexible"
             else -> "Muy flexible"
         }
@@ -1373,6 +1457,9 @@ class MainActivity : Activity() {
             },
             lp(MATCH, WRAP).apply { topMargin = dp(8) }
         )
+        if (analyzer.lastStats.isNotEmpty()) {
+            c.addView(tv("Diagnóstico: ${analyzer.lastStats}", 11f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        }
         val n = excludedFaces().size
         if (n > 0) {
             c.addView(smallPill("Deshacer correcciones «No es» ($n)") {
@@ -1383,8 +1470,6 @@ class MainActivity : Activity() {
         return c
     }
 
-    /** Similitud mínima entre caras: control a la izquierda = más estricto. */
-    private fun peopleThreshold(): Float = 0.65f - settings.peopleSens.coerceIn(0, 30) * 0.01f
 
     private fun excludedFaces(): Set<String> =
         getSharedPreferences("caras", MODE_PRIVATE).getStringSet("excluidas", null)?.toSet() ?: emptySet()
@@ -1399,7 +1484,7 @@ class MainActivity : Activity() {
         val ps = explorePhotos
         val nm = names()
         Thread {
-            val pp = try { analyzer.people(ps, nm, peopleThreshold(), excludedFaces()) } catch (_: Throwable) { people }
+            val pp = try { analyzer.people(ps, nm, settings.peopleSens, excludedFaces()) } catch (_: Throwable) { people }
             ui { people = pp; renderExplore() }
         }.start()
     }
@@ -1446,7 +1531,7 @@ class MainActivity : Activity() {
                 val done = photos.filter { it.contentDone }
                 analyzer.cancel = false
                 ui { exProgress?.progress = 960; exSub?.text = "Agrupando caras por persona…" }
-                val pp = analyzer.people(done, names(), peopleThreshold(), excludedFaces())
+                val pp = analyzer.people(done, names(), settings.peopleSens, excludedFaces())
                 ui {
                     explorePhotos = done
                     people = pp
@@ -1780,7 +1865,7 @@ class MainActivity : Activity() {
                     if (r != null && ok == 0) {
                         pendingWrite = { performEdit(ps, msg, change, after) }
                         try {
-                            startIntentSenderForResult(r.userAction.actionIntent.intentSender, REQ_WRITE, null, 0, 0, 0)
+                            awaitingResult = true; startIntentSenderForResult(r.userAction.actionIntent.intentSender, REQ_WRITE, null, 0, 0, 0)
                         } catch (_: Exception) {
                             toast("No tengo permiso para modificar esta foto")
                         }
@@ -1795,7 +1880,7 @@ class MainActivity : Activity() {
             try {
                 val pi = MediaStore.createWriteRequest(contentResolver, ps.map { it.uri })
                 pendingWrite = job
-                startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
+                awaitingResult = true; startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
             } catch (e: Exception) {
                 toast("No se pudo pedir permiso: ${e.message}")
             }
@@ -1819,7 +1904,7 @@ class MainActivity : Activity() {
             try {
                 val pi = MediaStore.createTrashRequest(contentResolver, targets.map { it.uri }, true)
                 pendingTrash = targets.map { it.id }.toSet()
-                startIntentSenderForResult(pi.intentSender, REQ_TRASH, null, 0, 0, 0)
+                awaitingResult = true; startIntentSenderForResult(pi.intentSender, REQ_TRASH, null, 0, 0, 0)
             } catch (e: Exception) {
                 toast("No se pudo mover a la papelera: ${e.message}")
             }
@@ -1845,6 +1930,7 @@ class MainActivity : Activity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
+        awaitingResult = false
         if (requestCode == REQ_TRASH && resultCode == RESULT_OK) removeDone(pendingTrash, "Movidas a la papelera")
         if (requestCode == REQ_WRITE) {
             val job = pendingWrite

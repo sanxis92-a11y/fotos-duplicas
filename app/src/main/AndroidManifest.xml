@@ -19,14 +19,42 @@
         android:requestLegacyExternalStorage="true"
         android:allowBackup="false"
         android:theme="@style/AppTheme">
+        <!-- Pantalla de entrada: calculadora. El código secreto abre la app. -->
         <activity
-            android:name=".MainActivity"
+            android:name=".CalculatorActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
+            android:excludeFromRecents="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
+
+        <!-- Dos accesos en el lanzador; solo uno activo (se cambia desde Ajustes) -->
+        <activity-alias
+            android:name=".LauncherPhotos"
+            android:targetActivity=".CalculatorActivity"
+            android:label="Fotos Duplicadas"
+            android:icon="@mipmap/ic_launcher"
+            android:enabled="true"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-        </activity>
+        </activity-alias>
+        <activity-alias
+            android:name=".LauncherCalc"
+            android:targetActivity=".CalculatorActivity"
+            android:label="Calculadora"
+            android:icon="@mipmap/ic_calc"
+            android:enabled="false"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden" />
     </application>
 </manifest>

@@ -111,7 +111,7 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         )
 
         const val MODEL_FILE = "mobile_face_net.tflite"
-        const val FACE_VERSION = "2"           // sube cuando cambia el cálculo de huellas
+        const val FACE_VERSION = "3"           // sube cuando cambia el cálculo de huellas
         const val MIN_FACE_SHARPNESS = 8.0
         /** Plantilla ArcFace 112×112: ojo izq., ojo dcho., nariz, boca izq., boca dcha. (de la imagen). */
         private val TEMPLATE = floatArrayOf(
@@ -225,7 +225,8 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                             scale = b.width.toFloat() / bmp.width
                         }
                     }
-                    if (bb.width() * scale >= 48f) emb = embed(src, bb, landmarks(f), scale)
+                    val pts = landmarks(f)
+                    if (pts != null && bb.width() * scale >= 56f) emb = embed(src, bb, pts, scale)
                 }
                 list += FaceInfo(
                     bb.left.toFloat() / bmp.width, bb.top.toFloat() / bmp.height,
@@ -344,8 +345,12 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
             }
             var n = 0.0
             for (x in v) n += x * x
-            val norm = sqrt(n).toFloat().takeIf { it > 0f } ?: return null
-            ByteArray(dim) { (v[it] / norm * 127f).roundToInt().coerceIn(-127, 127).toByte() }
+            if (n <= 0.0) return null
+            // Se guarda escalado al valor máximo: más precisión que escalar por la norma
+            var mx = 0f
+            for (x in v) mx = max(mx, abs(x))
+            if (mx <= 0f) return null
+            ByteArray(dim) { (v[it] / mx * 127f).roundToInt().coerceIn(-127, 127).toByte() }
         } catch (_: Throwable) { null }
     }
 
@@ -386,106 +391,116 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
 
     private class F(val p: Photo, val f: FaceInfo, val key: String, val v: FloatArray)
 
-    private fun centroid(m: List<F>): FloatArray {
-        val c = FloatArray(m[0].v.size)
-        for (x in m) for (k in c.indices) c[k] += x.v[k]
-        normalize(c)
-        return c
+    /** Datos del último agrupado, para mostrarlos en la app. */
+    @Volatile var lastStats: String = ""
+
+    private fun percentile(xs: List<Float>, q: Double): Float {
+        if (xs.isEmpty()) return 0f
+        val sorted = xs.sorted()
+        return sorted[((sorted.size - 1) * q).toInt().coerceIn(0, sorted.size - 1)]
     }
 
     /**
-     * Agrupa caras en tres pasadas:
-     *  1) asignación al grupo más parecido (empezando por las caras más grandes y nítidas),
-     *  2) fusión de grupos cuyos centros se parecen mucho,
-     *  3) recolocación de caras sueltas en el grupo grande más parecido.
-     * threshold: similitud coseno mínima (más alto = más estricto).
+     * Agrupa caras por persona.
+     *  1) Calibra el umbral con caras de la MISMA foto (son por fuerza personas distintas):
+     *     el umbral queda justo por encima de lo que se parecen dos desconocidos en estas fotos.
+     *  2) Une dos caras solo si cada una está entre las K más parecidas de la otra (vecinos mutuos)
+     *     y nunca si salen en la misma foto. Así no se forman cadenas que mezclen gente.
+     *  3) Chinese Whispers sobre ese grafo para formar los grupos.
+     * sens: 0..30, 15 = automático; más alto junta más.
      */
-    fun people(photos: List<Photo>, names: Map<String, String>, threshold: Float, excluded: Set<String>): List<Person> {
+    fun people(photos: List<Photo>, names: Map<String, String>, sens: Int, excluded: Set<String>): List<Person> {
         val faces = ArrayList<F>()
         for (p in photos) p.faces.forEachIndexed { i, f ->
             val e = f.emb
             val key = "${p.id}:$i"
             if (e != null && (dim == 0 || e.size == dim) && key !in excluded) faces += F(p, f, key, deq(e))
         }
-        if (faces.isEmpty()) return emptyList()
+        if (faces.isEmpty()) { lastStats = "Sin caras válidas"; return emptyList() }
         val size = faces[0].v.size
         faces.removeAll { it.v.size != size }
-        faces.sortByDescending { it.f.area }
+        val n = faces.size
 
-        // 1) Asignación voraz
-        var cents = ArrayList<FloatArray>()
-        var members = ArrayList<MutableList<F>>()
-        for (fc in faces) {
-            if (cancel) break
-            var best = -1
-            var bs = threshold
-            for (c in cents.indices) {
-                val s = dot(cents[c], fc.v)
-                if (s > bs) { bs = s; best = c }
+        // 1) Calibración
+        val same = ArrayList<Float>()
+        faces.indices.groupBy { faces[it].p.id }.values.forEach { idx ->
+            if (idx.size >= 2) for (a in idx.indices) for (b in a + 1 until idx.size) {
+                same += dot(faces[idx[a]].v, faces[idx[b]].v)
             }
-            if (best < 0) {
-                cents += fc.v.copyOf()
-                members += mutableListOf(fc)
-            } else {
-                val c = cents[best]
-                val n = members[best].size
-                for (k in c.indices) c[k] = (c[k] * n + fc.v[k]) / (n + 1)
-                normalize(c)
-                members[best] += fc
+        }
+        val auto = if (same.size >= 15) (percentile(same, 0.98) + 0.04f).coerceIn(0.30f, 0.85f) else 0.50f
+        val t = (auto + (15 - sens.coerceIn(0, 30)) * 0.012f).coerceIn(0.20f, 0.92f)
+
+        // 2) K vecinos más parecidos por encima del umbral
+        val k = 12
+        val nb = Array(n) { IntArray(k) { -1 } }
+        val ns = Array(n) { FloatArray(k) { -2f } }
+        fun offer(i: Int, j: Int, sim: Float) {
+            val a = ns[i]
+            var mi = 0
+            for (q in 1 until k) if (a[q] < a[mi]) mi = q
+            if (sim > a[mi]) { a[mi] = sim; nb[i][mi] = j }
+        }
+        for (i in 0 until n) {
+            if (cancel) return emptyList()
+            val vi = faces[i].v
+            val pi = faces[i].p.id
+            for (j in i + 1 until n) {
+                if (faces[j].p.id == pi) continue
+                val sim = dot(vi, faces[j].v)
+                if (sim > t) { offer(i, j, sim); offer(j, i, sim) }
+            }
+        }
+        val adj = Array(n) { ArrayList<Int>() }
+        val adjW = Array(n) { ArrayList<Float>() }
+        var edges = 0
+        for (i in 0 until n) for (q in 0 until k) {
+            val j = nb[i][q]
+            if (j > i && nb[j].contains(i)) {
+                adj[i] += j; adjW[i] += ns[i][q]
+                adj[j] += i; adjW[j] += ns[i][q]
+                edges++
             }
         }
 
-        // 2) Fusionar grupos (de 2 o más caras) con centros muy parecidos
-        val mergeT = threshold + 0.05f
-        for (round in 0 until 3) {
-            val idx = members.indices.filter { members[it].size >= 2 }
-            if (idx.size < 2) break
-            val parent = IntArray(members.size) { it }
-            fun find(x: Int): Int { var r = x; while (parent[r] != r) r = parent[r]; return r }
-            var merged = false
-            for (a in idx.indices) for (b in a + 1 until idx.size) {
-                val i = idx[a]
-                val j = idx[b]
-                if (dot(cents[i], cents[j]) > mergeT) {
-                    val ri = find(i)
-                    val rj = find(j)
-                    if (ri != rj) { parent[ri] = rj; merged = true }
+        // 3) Chinese Whispers
+        val label = IntArray(n) { it }
+        val order = (0 until n).toMutableList()
+        val rnd = java.util.Random(7)
+        repeat(20) {
+            order.shuffle(rnd)
+            var changed = 0
+            for (i in order) {
+                if (adj[i].isEmpty()) continue
+                val w = HashMap<Int, Float>()
+                for (q in adj[i].indices) {
+                    val l = label[adj[i][q]]
+                    w[l] = (w[l] ?: 0f) + adjW[i][q]
                 }
+                val best = w.maxBy { it.value }.key
+                if (best != label[i]) { label[i] = best; changed++ }
             }
-            if (!merged) break
-            val byRoot = LinkedHashMap<Int, MutableList<F>>()
-            for (i in members.indices) byRoot.getOrPut(find(i)) { mutableListOf() }.addAll(members[i])
-            members = ArrayList(byRoot.values)
-            cents = ArrayList(members.map { centroid(it) })
+            if (changed == 0) return@repeat
         }
 
-        // 3) Caras de grupos pequeños: al grupo grande más parecido, si se parece lo suficiente
-        val isBig = BooleanArray(members.size) { i -> members[i].map { it.p.id }.distinct().size >= MIN_FACES_PER_PERSON }
-        val bigIdx = members.indices.filter { isBig[it] }
-        if (bigIdx.isNotEmpty()) {
-            for (i in members.indices) if (!isBig[i]) {
-                for (fc in members[i]) {
-                    var best = -1
-                    var bs = threshold
-                    for (j in bigIdx) {
-                        val s = dot(cents[j], fc.v)
-                        if (s > bs) { bs = s; best = j }
-                    }
-                    if (best >= 0) members[best] += fc
-                }
-            }
-        }
+        val groups = (0 until n).groupBy { label[it] }.values
+            .filter { idx -> idx.map { faces[it].p.id }.distinct().size >= MIN_FACES_PER_PERSON }
+        lastStats = String.format(
+            java.util.Locale.getDefault(),
+            "%d caras · umbral %.2f (automático %.2f con %d parejas) · %d enlaces",
+            n, t, auto, same.size, edges
+        )
 
-        val raw = bigIdx.map { i ->
-            val m = members[i]
+        val raw = groups.map { idx ->
+            val m = idx.map { faces[it] }.sortedByDescending { it.f.area }
             val keys = m.map { it.key }
             val name = keys.firstNotNullOfOrNull { names[it] } ?: ""
             Person(keys, name, m.map { it.p to it.f })
         }
         // Personas con el mismo nombre se unen (así se pueden fusionar renombrando)
-        val named = raw.filter { it.name.isNotBlank() }.groupBy { it.name.trim().lowercase() }.values.map { same ->
-            if (same.size == 1) same[0]
-            else Person(same.flatMap { it.keys }, same[0].name, same.flatMap { it.faces })
+        val named = raw.filter { it.name.isNotBlank() }.groupBy { it.name.trim().lowercase() }.values.map { sameName ->
+            if (sameName.size == 1) sameName[0]
+            else Person(sameName.flatMap { it.keys }, sameName[0].name, sameName.flatMap { it.faces })
         }
         return (named + raw.filter { it.name.isBlank() }).sortedByDescending { it.photos.size }
     }

@@ -2,6 +2,7 @@ package com.sanxis.fotosduplicadas
 
 import android.content.Context
 import android.net.Uri
+import java.security.MessageDigest
 import kotlin.math.max
 import kotlin.math.min
 
@@ -51,6 +52,21 @@ class Settings(ctx: Context) {
             "Sin límite de tiempo", "Hechas con menos de 1 minuto", "Hechas con menos de 10 minutos",
             "Hechas con menos de 1 hora", "Hechas el mismo día (24 h)"
         )
+        const val DEFAULT_CODE = "5454+5353"
+
+        /** Pasa a la forma interna: × → *, ÷ → /, − → -, coma → punto, sin espacios. */
+        fun normalizeCode(s: String): String = s.trim()
+            .replace('×', '*').replace('x', '*').replace('X', '*')
+            .replace('÷', '/').replace(':', '/').replace('−', '-').replace(',', '.')
+            .replace(" ", "")
+
+        fun isValidCode(s: String): Boolean =
+            s.length >= 5 && Regex("^[0-9.]+([+\\-*/][0-9.]+)+$").matches(s)
+
+        fun hashCode(code: String): String =
+            MessageDigest.getInstance("SHA-256").digest(("fd-" + normalizeCode(code)).toByteArray())
+                .joinToString("") { "%02x".format(it) }
+
         val KEEP_LABELS = arrayOf(
             "La de mejor calidad", "La de mayor resolución", "La que más ocupa",
             "La más antigua", "La más reciente"
@@ -89,6 +105,17 @@ class Settings(ctx: Context) {
     var threshold: Int
         get() = sp.getInt("threshold", 12)
         set(v) { sp.edit().putInt("threshold", v).apply() }
+    /** Calculadora al abrir la app. */
+    var lockEnabled: Boolean
+        get() = sp.getBoolean("lockEnabled", true)
+        set(v) { sp.edit().putBoolean("lockEnabled", v).apply() }
+    var codeHash: String
+        get() = sp.getString("codeHash", null) ?: hashCode(DEFAULT_CODE)
+        set(v) { sp.edit().putString("codeHash", v).apply() }
+    var calcIcon: Boolean
+        get() = sp.getBoolean("calcIcon", false)
+        set(v) { sp.edit().putBoolean("calcIcon", v).apply() }
+
     /** 0..30: más alto = junta más caras como la misma persona. */
     var peopleSens: Int
         get() = sp.getInt("peopleSens", 15)
