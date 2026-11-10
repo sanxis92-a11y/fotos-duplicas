@@ -5,10 +5,10 @@ import android.content.ContentUris
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.media.ExifInterface
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import androidx.exifinterface.media.ExifInterface
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
@@ -100,8 +100,11 @@ class Scanner(private val cr: ContentResolver, private val dir: File) {
     }
 
     /** Imagen para ver en grande, con la orientación EXIF aplicada. */
-    fun decodeForView(uri: Uri): Bitmap? {
-        val b = decode(uri, 2048, atMost = true)?.bmp ?: return null
+    fun decodeForView(uri: Uri): Bitmap? = decodeUpright(uri, 2048)
+
+    /** Decodifica con el lado largo ≤ side y gira según la orientación EXIF. */
+    fun decodeUpright(uri: Uri, side: Int): Bitmap? {
+        val b = decode(uri, side, atMost = true)?.bmp ?: return null
         val orient = try {
             cr.openInputStream(uri)?.use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } ?: 1
         } catch (_: Exception) { 1 }

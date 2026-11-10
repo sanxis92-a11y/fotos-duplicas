@@ -17,11 +17,24 @@ class Photo(
     var contrast = 0.0   // desviación típica del gris (para no tomar fotos lisas por borrosas)
     var sharp = -1.0     // nitidez a ~1-2 MP, solo para fotos que están en un grupo
     var valid = false
+
+    // Contenido (pestaña Explorar)
+    var labels: List<String> = emptyList()
+    var faces: List<FaceInfo> = emptyList()
+    var hasGps = false
+    var gpsChecked = false   // false si no se pudo comprobar (sin permiso de ubicación de fotos)
+    var contentDone = false
+
     val pixels: Long get() = w.toLong() * h
     val ratio: Double get() = if (w > 0 && h > 0) max(w, h).toDouble() / min(w, h) else 1.0
 }
 
-enum class Kind { COPIES, SIMILAR, BLURRY }
+/** Cara detectada: caja normalizada 0..1 sobre la imagen ya enderezada y su huella (int8, normalizada). */
+class FaceInfo(val l: Float, val t: Float, val r: Float, val b: Float, val emb: ByteArray?) {
+    val area: Float get() = (r - l) * (b - t)
+}
+
+enum class Kind { COPIES, SIMILAR, BLURRY, BROWSE }
 
 class Group(val kind: Kind, val photos: MutableList<Photo>, var bestId: Long) {
     val delete = HashSet<Long>()

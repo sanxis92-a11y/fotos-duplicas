@@ -20,6 +20,25 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.14.3"
+      - name: Descargar modelo de caras (MobileFaceNet, licencia MIT)
+        continue-on-error: true
+        run: |
+          mkdir -p app/src/main/assets
+          F=app/src/main/assets/mobile_face_net.tflite
+          R=Yuvraj9198/RealtimeFaceRecognition
+          P=app/src/main/assets/mobile_face_net.tflite
+          for b in main master; do
+            curl -fsSL -o "$F" "https://github.com/$R/raw/$b/$P" || continue
+            if [ "$(stat -c%s "$F")" -lt 100000 ]; then
+              curl -fsSL -o "$F" "https://media.githubusercontent.com/media/$R/$b/$P" || true
+            fi
+            [ -f "$F" ] && [ "$(stat -c%s "$F")" -ge 100000 ] && break
+          done
+          if [ -f "$F" ] && [ "$(stat -c%s "$F")" -ge 100000 ]; then
+            echo "::notice::Modelo de caras incluido: $(stat -c%s "$F") bytes"
+          else
+            rm -f "$F"; echo "::warning::Sin modelo de caras: no se agrupará por persona"
+          fi
       - name: Compilar
         run: gradle :app:assembleDebug --no-daemon 2>&1 | tee build.log
       - name: Mostrar errores

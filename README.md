@@ -18,6 +18,14 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - Auto-marcar / Desmarcar todo, y «No son iguales» para que un grupo no vuelva a aparecer.
 - Modo claro y oscuro.
 
+## Explorar (v1.2)
+- **Personas:** detecta caras y las agrupa por persona (MobileFaceNet). Se les puede poner nombre; dos con el mismo nombre se unen.
+- **Con / sin personas, grupos y selfies.**
+- **Categorías:** capturas, documentos y recibos, WhatsApp, comida, animales, paisajes, ciudad, vehículos, fiestas, deporte, bebés y juguetes (ML Kit, modelo incluido en la APK).
+- **Privacidad:** lista de fotos con ubicación GPS y borrado de la ubicación o de todos los datos personales, por lotes.
+- **Metadatos:** ver fecha, cámara, objetivo, exposición, ISO, ubicación, autor… y editar fecha, descripción, autor y copyright (JPEG, PNG, WebP).
+- Las librerías de ML Kit piden Internet para estadísticas; el permiso se elimina del manifiesto, así que la app sigue sin conexión.
+
 ## Borrado
 - Android 11+: van a la **papelera del sistema** (recuperables 30 días) y Android pide confirmación.
 - Android 8–10: borrado definitivo, con aviso previo.
