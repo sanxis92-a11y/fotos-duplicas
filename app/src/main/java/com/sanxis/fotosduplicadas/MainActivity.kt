@@ -3,64 +3,53 @@ package com.sanxis.fotosduplicadas
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.content.ContentUris
+import android.app.Dialog
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
-import android.net.Uri
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
+import android.text.TextUtils
 import android.util.LruCache
 import android.util.Size
 import android.util.TypedValue
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.widget.ArrayAdapter
 import android.widget.BaseAdapter
-import android.widget.Button
+import android.widget.CheckBox
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
-import android.widget.RadioButton
-import android.widget.RadioGroup
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
-import java.io.File
+import java.text.DateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
-import kotlin.math.min
-
-/** Una foto de la galería con su huella visual y su puntuación de nitidez. */
-class Photo(
-    val id: Long, val uri: Uri, val name: String,
-    var w: Int, var h: Int, val size: Long, val date: Long, val modified: Long
-) {
-    var h1 = 0L      // dHash horizontal (64 bits)
-    var h2 = 0L      // dHash vertical (64 bits)
-    var lum = 0      // brillo medio 0..255
-    var sharp = -1.0 // varianza del Laplaciano (más alto = más nítida)
-    var valid = false
-    val pixels: Long get() = w.toLong() * h
-    val ratio: Double get() = if (w > 0 && h > 0) max(w, h).toDouble() / min(w, h) else 1.0
-}
-
-class Group(val photos: MutableList<Photo>, val bestId: Long) {
-    val delete = HashSet<Long>()
-    fun reclaim(): Long = photos.filter { it.id in delete }.sumOf { it.size }
-}
 
 class MainActivity : Activity() {
 
@@ -69,133 +58,388 @@ class MainActivity : Activity() {
         const val REQ_TRASH = 2
         const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
         const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
-        val GREEN = Color.parseColor("#2E7D32")
-        val RED = Color.parseColor("#C62828")
-        val DARK = Color.parseColor("#1A1A1A")
-        val GREY = Color.parseColor("#5F6368")
-        // Umbral de diferencia (sobre 128 bits) para cada nivel de sensibilidad
-        val THRESHOLDS = intArrayOf(6, 12, 20)
     }
+
+    // ---------------------------------------------------------------- Paleta (claro / oscuro)
+
+    private var dark = false
+    private var cBg = 0
+    private var cCard = 0
+    private var cText = 0
+    private var cSub = 0
+    private var cAccent = 0
+    private var cGreen = 0
+    private var cRed = 0
+    private var cLine = 0
+    private var cTeal = 0
+    private var cAmber = 0
+
+    private fun initPalette() {
+        dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+        fun c(light: String, night: String) = Color.parseColor(if (dark) night else light)
+        cBg = c("#F4F5FA", "#0F1115")
+        cCard = c("#FFFFFF", "#1A1D24")
+        cText = c("#15171C", "#EEF0F5")
+        cSub = c("#6B7080", "#9AA0AE")
+        cAccent = c("#4F46E5", "#818CF8")
+        cGreen = c("#16A34A", "#22C55E")
+        cRed = c("#DC2626", "#F87171")
+        cLine = c("#E6E8F0", "#2A2E38")
+        cTeal = c("#0D9488", "#2DD4BF")
+        cAmber = c("#D97706", "#FBBF24")
+    }
+
+    // ---------------------------------------------------------------- Estado
 
     private val main = Handler(Looper.getMainLooper())
     private val thumbPool = Executors.newFixedThreadPool(3)
     private val thumbs = object : LruCache<Long, Bitmap>((Runtime.getRuntime().maxMemory() / 8).toInt()) {
         override fun sizeOf(key: Long, value: Bitmap): Int = value.byteCount
     }
-
-    private var groups = mutableListOf<Group>()
-    @Volatile private var scanning = false
-    @Volatile private var cancel = false
+    private lateinit var settings: Settings
+    private lateinit var scanner: Scanner
+    private var allPhotos: List<Photo> = emptyList()
+    private var dupGroups = mutableListOf<Group>()
+    private var blurGroups = mutableListOf<Group>()
+    private var scanned = false
+    private var tab = 0
+    @Volatile private var busy = false
     private var pendingTrash: Set<Long> = emptySet()
-
-    private lateinit var scanBtn: Button
-    private lateinit var deleteBtn: Button
-    private lateinit var progress: ProgressBar
-    private lateinit var status: TextView
-    private lateinit var sens: RadioGroup
+    private var afterPerm: (() -> Unit)? = null
     private val groupAdapter = GroupAdapter()
+    private val current: MutableList<Group> get() = if (tab == 0) dupGroups else blurGroups
+
+    private lateinit var heroTitle: TextView
+    private lateinit var heroSub: TextView
+    private lateinit var progress: ProgressBar
+    private lateinit var scanBtn: TextView
+    private lateinit var tabsBox: LinearLayout
+    private lateinit var tabDup: TextView
+    private lateinit var tabBlur: TextView
+    private lateinit var simCard: LinearLayout
+    private lateinit var simValue: TextView
+    private lateinit var simBar: SeekBar
+    private lateinit var actionsRow: LinearLayout
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var deleteBtn: TextView
+
+    // ---------------------------------------------------------------- Utilidades de vista
 
     private fun dp(v: Int): Int =
         TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
-
     private fun ui(f: () -> Unit) { main.post(f) }
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
+    private fun csl(c: Int) = ColorStateList.valueOf(c)
+    private fun withAlpha(c: Int, a: Int) = (c and 0x00FFFFFF) or (a shl 24)
+    private fun lp(w: Int, h: Int) = LinearLayout.LayoutParams(w, h)
     private fun mb(b: Long): String =
         if (b >= (1L shl 30)) String.format(Locale.getDefault(), "%.2f GB", b / 1073741824.0)
         else String.format(Locale.getDefault(), "%.1f MB", b / 1048576.0)
     private fun mp(p: Photo): String = String.format(Locale.getDefault(), "%.1f MP", p.pixels / 1_000_000.0)
+    private fun fmtDate(ms: Long): String =
+        DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(ms))
     private val trashVerb: String get() = if (Build.VERSION.SDK_INT >= 30) "Mover a la papelera" else "Borrar"
 
-    // ---------------------------------------------------------------- UI
+    private fun round(color: Int, radius: Int, stroke: Int = 0, strokeColor: Int = 0) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius).toFloat()
+        if (stroke > 0) setStroke(dp(stroke), strokeColor)
+    }
+
+    private fun ripple(content: Drawable?, radius: Int): Drawable =
+        RippleDrawable(csl(if (dark) 0x33FFFFFF else 0x22000000), content, round(Color.WHITE, radius))
+
+    private fun tv(s: CharSequence = "", size: Float = 14f, color: Int = cText, medium: Boolean = false, bold: Boolean = false) =
+        TextView(this).apply {
+            text = s
+            textSize = size
+            setTextColor(color)
+            typeface = when {
+                bold -> Typeface.create("sans-serif", Typeface.BOLD)
+                medium -> Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                else -> Typeface.create("sans-serif", Typeface.NORMAL)
+            }
+        }
+
+    private fun row() = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+    }
+
+    private fun card() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = round(cCard, 20)
+        setPadding(dp(16), dp(16), dp(16), dp(16))
+        if (!dark) elevation = dp(1).toFloat()
+    }
+
+    private fun chip(text: String, color: Int) = tv(text, 12f, color, medium = true).apply {
+        background = round(withAlpha(color, 0x24), 10)
+        setPadding(dp(10), dp(4), dp(10), dp(4))
+    }
+
+    private fun styleFilled(v: TextView, color: Int) {
+        v.background = ripple(round(color, 16), 16)
+        v.setTextColor(Color.WHITE)
+    }
+
+    private fun styleSoft(v: TextView, color: Int) {
+        v.background = ripple(round(withAlpha(color, 0x24), 16), 16)
+        v.setTextColor(color)
+    }
+
+    private fun pillButton(text: String, filled: Boolean, color: Int, onClick: () -> Unit) =
+        tv(text, 15f, color, medium = true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(16), dp(15), dp(16), dp(15))
+            if (filled) styleFilled(this, color) else styleSoft(this, color)
+            setOnClickListener { onClick() }
+        }
+
+    private fun smallPill(text: String, onClick: () -> Unit) = tv(text, 13f, cAccent, medium = true).apply {
+        gravity = Gravity.CENTER
+        setPadding(dp(14), dp(9), dp(14), dp(9))
+        background = ripple(round(withAlpha(cAccent, 0x1F), 12), 12)
+        setOnClickListener { onClick() }
+    }
+
+    // ---------------------------------------------------------------- Pantalla principal
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val pad = dp(16)
+        initPalette()
+        settings = Settings(this)
+        scanner = Scanner(contentResolver, filesDir)
+
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#F3F4F7"))
-            setPadding(pad, pad, pad, pad / 2)
+            setBackgroundColor(cBg)
         }
         root.setOnApplyWindowInsetsListener { v, insets ->
             if (Build.VERSION.SDK_INT >= 30) {
                 val b = insets.getInsets(WindowInsets.Type.systemBars())
-                v.setPadding(b.left + pad, b.top + pad, b.right + pad, b.bottom + pad / 2)
+                v.setPadding(b.left, b.top, b.right, b.bottom)
             } else {
                 @Suppress("DEPRECATION")
                 v.setPadding(
-                    insets.systemWindowInsetLeft + pad, insets.systemWindowInsetTop + pad,
-                    insets.systemWindowInsetRight + pad, insets.systemWindowInsetBottom + pad / 2
+                    insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
+                    insets.systemWindowInsetRight, insets.systemWindowInsetBottom
                 )
             }
             insets
         }
 
-        root.addView(TextView(this).apply {
-            text = "Fotos duplicadas"
-            textSize = 24f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(DARK)
-        })
-        root.addView(TextView(this).apply {
-            text = "100 % offline: la app no tiene permiso de Internet. Nada sale del móvil."
-            textSize = 13f
-            setTextColor(GREY)
-            setPadding(0, dp(2), 0, dp(12))
-        })
-        root.addView(TextView(this).apply {
-            text = "Sensibilidad"
-            textSize = 13f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(DARK)
-        })
-        sens = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        listOf("Casi idénticas", "Normal", "Ráfagas").forEachIndexed { i, s ->
-            sens.addView(RadioButton(this).apply { id = 100 + i; text = s; textSize = 14f })
-        }
-        sens.check(101)
-        root.addView(sens)
-
-        scanBtn = Button(this).apply {
-            text = "Buscar duplicadas"
-            setOnClickListener { onScanClick() }
-        }
-        root.addView(scanBtn, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(6) })
-
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            visibility = View.GONE
-            max = 100
-        }
-        root.addView(progress, MATCH, WRAP)
-
-        status = TextView(this).apply {
-            textSize = 13f
-            setTextColor(DARK)
-            setPadding(0, dp(6), 0, dp(6))
-            text = "Pulsa «Buscar duplicadas». La mejor de cada grupo se conserva y el resto se marca para borrar."
-        }
-        root.addView(status)
-
         val list = ListView(this).apply {
-            adapter = groupAdapter
             divider = null
             dividerHeight = 0
+            selector = ColorDrawable(Color.TRANSPARENT)
+            setPadding(dp(16), dp(4), dp(16), dp(16))
+            clipToPadding = false
+            isVerticalScrollBarEnabled = false
         }
+        list.addHeaderView(buildHeader(), null, false)
+        list.adapter = groupAdapter
         root.addView(list, LinearLayout.LayoutParams(MATCH, 0, 1f))
 
-        deleteBtn = Button(this).apply {
-            text = trashVerb
-            isEnabled = false
-            setOnClickListener { deleteSelected() }
+        bottomBar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(12))
+            setBackgroundColor(cBg)
+            visibility = View.GONE
         }
-        root.addView(deleteBtn, MATCH, WRAP)
+        deleteBtn = pillButton("", true, cRed) { deleteSelected() }
+        bottomBar.addView(deleteBtn, MATCH, WRAP)
+        root.addView(bottomBar, MATCH, WRAP)
 
         setContentView(root)
+        updateUi()
     }
 
     override fun onDestroy() {
-        cancel = true
+        scanner.cancel = true
         thumbPool.shutdownNow()
         super.onDestroy()
+    }
+
+    private fun buildHeader(): View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, dp(6))
+        }
+
+        // Cabecera
+        val top = row()
+        val titles = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        titles.addView(tv("Fotos duplicadas", 26f, cText, bold = true))
+        titles.addView(chip("●  Privada · 100 % offline", cGreen), lp(WRAP, WRAP).apply { topMargin = dp(8) })
+        top.addView(titles, LinearLayout.LayoutParams(0, WRAP, 1f))
+        val gear = tv("⚙", 22f, cText).apply {
+            gravity = Gravity.CENTER
+            background = ripple(round(cCard, 22), 22)
+            if (!dark) elevation = dp(1).toFloat()
+            contentDescription = "Ajustes"
+            setOnClickListener { showSettings() }
+        }
+        top.addView(gear, LinearLayout.LayoutParams(dp(46), dp(46)))
+        box.addView(top)
+
+        // Tarjeta principal
+        val hero = card().apply { setPadding(dp(20), dp(20), dp(20), dp(20)) }
+        heroTitle = tv("", 30f, cText, bold = true)
+        heroSub = tv("", 14f, cSub).apply { setLineSpacing(0f, 1.2f) }
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progressTintList = csl(cAccent)
+            progressBackgroundTintList = csl(cLine)
+            visibility = View.GONE
+        }
+        scanBtn = pillButton("Buscar duplicadas", true, cAccent) { onScanClick() }
+        hero.addView(heroTitle)
+        hero.addView(heroSub, lp(MATCH, WRAP).apply { topMargin = dp(6) })
+        hero.addView(progress, lp(MATCH, dp(10)).apply { topMargin = dp(16) })
+        hero.addView(scanBtn, lp(MATCH, WRAP).apply { topMargin = dp(18) })
+        box.addView(hero, lp(MATCH, WRAP).apply { topMargin = dp(18) })
+
+        // Pestañas
+        tabsBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            background = round(cLine, 16)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        tabDup = tabItem { selectTab(0) }
+        tabBlur = tabItem { selectTab(1) }
+        tabsBox.addView(tabDup, LinearLayout.LayoutParams(0, WRAP, 1f))
+        tabsBox.addView(tabBlur, LinearLayout.LayoutParams(0, WRAP, 1f))
+        box.addView(tabsBox, lp(MATCH, WRAP).apply { topMargin = dp(16) })
+
+        // Control de parecido
+        simCard = card()
+        val sr = row()
+        sr.addView(tv("Parecido entre fotos", 15f, cText, medium = true), LinearLayout.LayoutParams(0, WRAP, 1f))
+        simValue = tv("", 14f, cAccent, medium = true)
+        sr.addView(simValue)
+        simCard.addView(sr)
+        simBar = SeekBar(this).apply {
+            max = 24
+            progress = settings.threshold.coerceIn(0, 24)
+            progressTintList = csl(cAccent)
+            thumbTintList = csl(cAccent)
+            progressBackgroundTintList = csl(cLine)
+        }
+        simBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, value: Int, fromUser: Boolean) {
+                simValue.text = simLabel(value)
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                settings.threshold = simBar.progress
+                if (scanned && !busy) recluster()
+            }
+        })
+        simCard.addView(simBar, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+        val hints = row()
+        hints.addView(tv("Solo copias", 12f, cSub), LinearLayout.LayoutParams(0, WRAP, 1f))
+        hints.addView(tv("Ráfagas", 12f, cSub))
+        simCard.addView(hints, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+        simValue.text = simLabel(simBar.progress)
+        box.addView(simCard, lp(MATCH, WRAP).apply { topMargin = dp(12) })
+
+        // Acciones rápidas
+        actionsRow = row()
+        actionsRow.addView(smallPill("Auto-marcar") { autoMark() })
+        actionsRow.addView(smallPill("Desmarcar todo") { unmarkAll() }, lp(WRAP, WRAP).apply { leftMargin = dp(8) })
+        box.addView(actionsRow, lp(MATCH, WRAP).apply { topMargin = dp(14) })
+
+        return box
+    }
+
+    private fun tabItem(onClick: () -> Unit) = tv("", 14f, cSub, medium = true).apply {
+        gravity = Gravity.CENTER
+        setPadding(dp(8), dp(10), dp(8), dp(10))
+        setOnClickListener { onClick() }
+    }
+
+    private fun styleTab(v: TextView, selected: Boolean, text: String) {
+        v.text = text
+        v.background = if (selected) round(cCard, 12) else null
+        v.setTextColor(if (selected) cText else cSub)
+    }
+
+    private fun simLabel(v: Int) = when {
+        v <= 4 -> "Solo copias exactas"
+        v <= 9 -> "Casi idénticas"
+        v <= 15 -> "Normal"
+        else -> "Amplio (ráfagas)"
+    }
+
+    private fun selectTab(t: Int) {
+        tab = t
+        groupAdapter.notifyDataSetChanged()
+        updateUi()
+    }
+
+    private fun hero(title: String, sub: String) {
+        heroTitle.text = title
+        heroSub.text = sub
+    }
+
+    private fun updateUi() {
+        val hasBlur = blurGroups.isNotEmpty()
+        if (!hasBlur && tab == 1) tab = 0
+        val results = scanned && !busy
+        val blurCount = blurGroups.sumOf { it.photos.size }
+
+        tabsBox.visibility = if (results && hasBlur) View.VISIBLE else View.GONE
+        styleTab(tabDup, tab == 0, "Duplicadas · ${dupGroups.size}")
+        styleTab(tabBlur, tab == 1, "Borrosas · $blurCount")
+        simCard.visibility = if (scanned && tab == 0) View.VISIBLE else View.GONE
+        simBar.isEnabled = !busy
+        actionsRow.visibility = if (results && current.isNotEmpty()) View.VISIBLE else View.GONE
+
+        val n = current.sumOf { it.delete.size }
+        val bytes = current.sumOf { it.reclaim() }
+        if (!busy) {
+            progress.visibility = View.GONE
+            scanBtn.text = if (scanned) "Buscar de nuevo" else "Buscar duplicadas"
+            styleFilled(scanBtn, cAccent)
+            when {
+                !scanned -> hero(
+                    "Libera espacio sin perder fotos",
+                    "Busco copias y fotos casi iguales y conservo la mejor de cada grupo. Todo se analiza en tu móvil."
+                )
+                tab == 1 -> hero(
+                    "$blurCount posibles borrosas",
+                    if (n > 0) "$n marcadas · ${mb(bytes)}" else "Revísalas y toca las que quieras borrar."
+                )
+                dupGroups.isEmpty() -> hero(
+                    "Todo limpio ✓",
+                    "No hay fotos repetidas con estos ajustes. Prueba a mover el control de parecido."
+                )
+                else -> hero(
+                    mb(bytes),
+                    "se pueden liberar · ${dupGroups.size} grupos · $n ${if (n == 1) "foto marcada" else "fotos marcadas"}"
+                )
+            }
+        }
+        bottomBar.visibility = if (results && n > 0) View.VISIBLE else View.GONE
+        deleteBtn.text = "$trashVerb $n ${if (n == 1) "foto" else "fotos"} · ${mb(bytes)}"
+    }
+
+    private fun showBusy(title: String) {
+        updateUi()
+        heroTitle.text = title
+        heroSub.text = ""
+        progress.progress = 0
+        progress.visibility = View.VISIBLE
+        scanBtn.text = "Cancelar"
+        styleSoft(scanBtn, cRed)
+        bottomBar.visibility = View.GONE
+        actionsRow.visibility = View.GONE
+    }
+
+    private fun progressUi(pct: Int, msg: String) = ui {
+        progress.progress = pct * 10
+        heroSub.text = msg
     }
 
     // ---------------------------------------------------------------- Permisos
@@ -208,298 +452,136 @@ class MainActivity : Activity() {
 
     private fun hasPerms() = perms().all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }
 
-    private fun onScanClick() {
-        if (scanning) { cancel = true; return }
-        if (hasPerms()) startScan() else requestPermissions(perms(), REQ_PERM)
+    private fun ensurePerms(then: () -> Unit) {
+        if (hasPerms()) then() else {
+            afterPerm = then
+            requestPermissions(perms(), REQ_PERM)
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ_PERM) {
-            if (hasPerms()) startScan()
-            else status.text = "Sin permiso para leer tus fotos no puedo buscar duplicadas."
+        if (requestCode != REQ_PERM) return
+        if (hasPerms()) {
+            val f = afterPerm
+            afterPerm = null
+            f?.invoke()
+        } else {
+            toast("Sin permiso para leer tus fotos no puedo buscar duplicadas")
         }
     }
 
     // ---------------------------------------------------------------- Escaneo
 
-    private fun startScan() {
-        scanning = true
-        cancel = false
-        val thr = THRESHOLDS[(sens.checkedRadioButtonId - 100).coerceIn(0, 2)]
-        scanBtn.text = "Cancelar"
-        deleteBtn.isEnabled = false
-        progress.visibility = View.VISIBLE
-        progress.progress = 0
-        groups = mutableListOf()
-        groupAdapter.notifyDataSetChanged()
+    private fun onScanClick() {
+        if (busy) { scanner.cancel = true; return }
+        ensurePerms { startScan() }
+    }
 
+    private fun startScan() {
+        if (busy) return
+        busy = true
+        scanner.cancel = false
+        dupGroups = mutableListOf()
+        blurGroups = mutableListOf()
+        groupAdapter.notifyDataSetChanged()
+        showBusy("Analizando…")
         Thread {
             var error: String? = null
-            val result = try { scan(thr) } catch (e: Throwable) { error = e.message ?: e.toString(); null }
+            val ok = try { runScan() } catch (e: Throwable) { error = e.message ?: e.toString(); false }
             ui {
-                scanning = false
-                scanBtn.text = "Buscar duplicadas"
-                progress.visibility = View.GONE
-                when {
-                    result != null -> { groups = result; groupAdapter.notifyDataSetChanged(); updateSummary() }
-                    error != null -> status.text = "Error: $error"
-                    else -> status.text = "Búsqueda cancelada."
-                }
+                busy = false
+                if (ok) scanned = true
+                else toast(if (error != null) "Error: $error" else "Búsqueda cancelada")
+                groupAdapter.notifyDataSetChanged()
+                updateUi()
             }
         }.start()
     }
 
-    private fun scan(thr: Int): MutableList<Group>? {
-        ui { status.text = "Leyendo la galería…" }
-        val photos = queryPhotos()
-        val cache = loadCache()
+    private fun runScan(): Boolean {
+        val s = settings
+        progressUi(0, "Leyendo la galería…")
+        val photos = scanner.query(s)
+        val cache = scanner.loadCache()
         val total = photos.size
-
-        // 1) Huella visual de cada foto (con caché para que la segunda vez vuele)
         for ((i, p) in photos.withIndex()) {
-            if (cancel) return null
-            val c = cache[p.id]
-            if (c != null && c.size == p.size && c.modified == p.modified) {
-                p.w = c.w; p.h = c.h; p.h1 = c.h1; p.h2 = c.h2; p.lum = c.lum; p.valid = true
-            } else {
-                hashPhoto(p)
-            }
-            if (i % 25 == 0) {
-                val pct = i * 80 / max(1, total)
-                ui { progress.progress = pct; status.text = "Analizando ${i + 1} de $total fotos…" }
-            }
+            if (scanner.cancel) return false
+            if (!scanner.applyCache(p, cache[p.id], s.blurry)) scanner.analyze(p, s.blurry)
+            if (i % 25 == 0) progressUi(i * 75 / max(1, total), "Analizando ${i + 1} de $total fotos")
         }
-        saveCache(photos)
-
-        // 2) Agrupar las parecidas
-        ui { status.text = "Comparando…" }
-        val raw = cluster(photos.filter { it.valid }, thr)
-        if (cancel) return null
-
-        // 3) Nitidez solo de las que están en algún grupo
-        val members = raw.flatten()
-        for ((i, p) in members.withIndex()) {
-            if (cancel) return null
-            if (p.sharp < 0) p.sharp = sharpness(p.uri)
-            if (i % 5 == 0) {
-                val pct = 80 + i * 20 / max(1, members.size)
-                ui { progress.progress = pct; status.text = "Evaluando calidad ${i + 1} de ${members.size}…" }
-            }
+        scanner.saveCache(photos)
+        val valid = photos.filter { it.valid }
+        progressUi(75, "Comparando fotos…")
+        val dups = scanner.buildDuplicates(valid, s, { pct, msg -> progressUi(pct, msg) }, 75, 25) ?: return false
+        val blur = if (s.blurry) scanner.buildBlurry(valid) else mutableListOf()
+        ui {
+            allPhotos = valid
+            dupGroups = dups
+            blurGroups = blur
         }
-
-        // 4) Elegir la mejor de cada grupo y marcar el resto
-        return raw.map { g ->
-            val best = g.reduce { a, b -> if (better(b, a)) b else a }
-            val ordered = (listOf(best) + g.filter { it !== best }.sortedByDescending { it.pixels }).toMutableList()
-            Group(ordered, best.id).also { gr -> g.forEach { if (it !== best) gr.delete.add(it.id) } }
-        }.sortedByDescending { it.reclaim() }.toMutableList()
+        return true
     }
 
-    private fun queryPhotos(): List<Photo> {
-        val out = ArrayList<Photo>()
-        val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val proj = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.WIDTH,
-            MediaStore.Images.Media.HEIGHT,
-            MediaStore.Images.Media.SIZE,
-            MediaStore.Images.Media.DATE_TAKEN,
-            MediaStore.Images.Media.DATE_MODIFIED
-        )
-        contentResolver.query(base, proj, null, null, "${MediaStore.Images.Media.DATE_ADDED} DESC")?.use { c ->
-            while (c.moveToNext()) {
-                val id = c.getLong(0)
-                out += Photo(
-                    id, ContentUris.withAppendedId(base, id), c.getString(1) ?: "",
-                    c.getInt(2), c.getInt(3), c.getLong(4), c.getLong(5), c.getLong(6)
-                )
+    private fun recluster() {
+        if (busy || allPhotos.isEmpty()) return
+        busy = true
+        scanner.cancel = false
+        showBusy("Reagrupando…")
+        val photos = allPhotos
+        Thread {
+            val res = try {
+                scanner.buildDuplicates(photos, settings, { pct, msg -> progressUi(pct, msg) }, 0, 100)
+            } catch (_: Throwable) { null }
+            ui {
+                busy = false
+                if (res != null) dupGroups = res
+                groupAdapter.notifyDataSetChanged()
+                updateUi()
             }
-        }
-        return out
+        }.start()
     }
 
-    // ---------------------------------------------------------------- Imagen
+    // ---------------------------------------------------------------- Marcas
 
-    private class Decoded(val bmp: Bitmap, val w: Int, val h: Int)
-
-    /** Decodifica reducida (lado largo entre side y 2*side) y devuelve también el tamaño real. */
-    private fun decode(uri: Uri, side: Int): Decoded? {
-        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        val ins = contentResolver.openInputStream(uri) ?: return null
-        ins.use { BitmapFactory.decodeStream(it, null, o) }
-        if (o.outWidth <= 0 || o.outHeight <= 0) return null
-        var s = 1
-        while (max(o.outWidth, o.outHeight) / (s * 2) >= side) s *= 2
-        val o2 = BitmapFactory.Options().apply { inSampleSize = s }
-        val bmp = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, o2) } ?: return null
-        return Decoded(bmp, o.outWidth, o.outHeight)
+    private fun autoMark() {
+        if (tab == 0) dupGroups.forEach { scanner.remark(it, settings) }
+        else blurGroups.forEach { g -> g.photos.forEach { g.delete.add(it.id) } }
+        groupAdapter.notifyDataSetChanged()
+        updateUi()
     }
 
-    private fun gray(b: Bitmap): IntArray {
-        val w = b.width
-        val h = b.height
-        val px = IntArray(w * h)
-        b.getPixels(px, 0, w, 0, 0, w, h)
-        for (i in px.indices) {
-            val c = px[i]
-            px[i] = (((c shr 16) and 0xFF) * 299 + ((c shr 8) and 0xFF) * 587 + (c and 0xFF) * 114) / 1000
-        }
-        return px
+    private fun unmarkAll() {
+        current.forEach { it.delete.clear() }
+        groupAdapter.notifyDataSetChanged()
+        updateUi()
     }
 
-    /** Media por celdas (reducción con antialiasing). */
-    private fun pool(g: IntArray, w: Int, h: Int, cols: Int, rows: Int): FloatArray {
-        val out = FloatArray(cols * rows)
-        for (r in 0 until rows) for (c in 0 until cols) {
-            val x0 = c * w / cols
-            val x1 = max(x0 + 1, (c + 1) * w / cols)
-            val y0 = r * h / rows
-            val y1 = max(y0 + 1, (r + 1) * h / rows)
-            var sum = 0L
-            for (y in y0 until y1) for (x in x0 until x1) sum += g[y * w + x]
-            out[r * cols + c] = sum.toFloat() / ((x1 - x0) * (y1 - y0))
-        }
-        return out
-    }
-
-    private fun hashPhoto(p: Photo) {
-        try {
-            val d = decode(p.uri, 160) ?: return
-            p.w = d.w
-            p.h = d.h
-            val bw = d.bmp.width
-            val bh = d.bmp.height
-            val g = gray(d.bmp)
-            d.bmp.recycle()
-
-            val a = pool(g, bw, bh, 9, 8)
-            var h1 = 0L
-            var bit = 0
-            for (r in 0 until 8) for (c in 0 until 8) {
-                if (a[r * 9 + c] > a[r * 9 + c + 1]) h1 = h1 or (1L shl bit)
-                bit++
+    /** Devuelve false si no se permite (dejaría el grupo sin ninguna foto). */
+    private fun toggle(g: Group, p: Photo): Boolean {
+        if (p.id in g.delete) {
+            g.delete.remove(p.id)
+        } else {
+            if (g.kind != Kind.BLURRY && g.photos.count { it.id !in g.delete } <= 1) {
+                toast("Tiene que quedar al menos una foto de cada grupo")
+                return false
             }
-            val b = pool(g, bw, bh, 8, 9)
-            var h2 = 0L
-            bit = 0
-            for (r in 0 until 8) for (c in 0 until 8) {
-                if (b[r * 8 + c] > b[(r + 1) * 8 + c]) h2 = h2 or (1L shl bit)
-                bit++
-            }
-            p.h1 = h1
-            p.h2 = h2
-            p.lum = (g.fold(0L) { acc, v -> acc + v } / max(1, g.size)).toInt()
-            p.valid = true
-        } catch (_: Throwable) {
-            // Archivo corrupto o formato no soportado: se ignora
+            g.delete.add(p.id)
         }
+        groupAdapter.notifyDataSetChanged()
+        updateUi()
+        return true
     }
 
-    /** Nitidez = varianza del Laplaciano sobre la imagen a ~1–2 MP. */
-    private fun sharpness(uri: Uri): Double = try {
-        val d = decode(uri, 1024)
-        if (d == null) 0.0 else {
-            val w = d.bmp.width
-            val h = d.bmp.height
-            val g = gray(d.bmp)
-            d.bmp.recycle()
-            var s = 0.0
-            var sq = 0.0
-            var n = 0
-            for (y in 1 until h - 1) {
-                var i = y * w + 1
-                for (x in 1 until w - 1) {
-                    val l = (4 * g[i] - g[i - 1] - g[i + 1] - g[i - w] - g[i + w]).toDouble()
-                    s += l; sq += l * l; n++; i++
-                }
-            }
-            if (n == 0) 0.0 else sq / n - (s / n) * (s / n)
-        }
-    } catch (_: Throwable) { 0.0 }
-
-    private fun cluster(list: List<Photo>, thr: Int): List<List<Photo>> {
-        val ps = list.sortedBy { it.lum }
-        val n = ps.size
-        val parent = IntArray(n) { it }
-        fun find(x: Int): Int {
-            var r = x
-            while (parent[r] != r) r = parent[r]
-            var y = x
-            while (parent[y] != r) { val nx = parent[y]; parent[y] = r; y = nx }
-            return r
-        }
-        for (i in 0 until n) {
-            if (cancel) break
-            val a = ps[i]
-            val ar = a.ratio
-            var j = i + 1
-            while (j < n && ps[j].lum - a.lum <= 20) {
-                val b = ps[j]
-                if (abs(ar - b.ratio) < 0.08) {
-                    val d = java.lang.Long.bitCount(a.h1 xor b.h1) + java.lang.Long.bitCount(a.h2 xor b.h2)
-                    if (d <= thr) {
-                        val ra = find(i)
-                        val rb = find(j)
-                        if (ra != rb) parent[ra] = rb
-                    }
-                }
-                j++
-            }
-        }
-        return (0 until n).groupBy { find(it) }.values.filter { it.size > 1 }.map { idx -> idx.map { ps[it] } }
+    private fun notSame(g: Group) {
+        scanner.addIgnored(g.photos.map { it.id })
+        dupGroups.remove(g)
+        groupAdapter.notifyDataSetChanged()
+        updateUi()
+        toast("Entendido: este grupo no volverá a aparecer")
     }
 
-    /** ¿a es mejor que b? Resolución > nitidez > peso del archivo (menos compresión) > la más antigua (original). */
-    private fun better(a: Photo, b: Photo): Boolean {
-        val pa = a.pixels
-        val pb = b.pixels
-        if (pa > pb * 105 / 100) return true
-        if (pb > pa * 105 / 100) return false
-        if (a.sharp > b.sharp * 1.10) return true
-        if (b.sharp > a.sharp * 1.10) return false
-        if (a.size != b.size) return a.size > b.size
-        return a.date <= b.date
-    }
-
-    // ---------------------------------------------------------------- Caché
-
-    private class Cached(val size: Long, val modified: Long, val w: Int, val h: Int, val h1: Long, val h2: Long, val lum: Int)
-
-    private fun cacheFile() = File(filesDir, "hashes_v1.txt")
-
-    private fun loadCache(): Map<Long, Cached> {
-        val m = HashMap<Long, Cached>()
-        val f = cacheFile()
-        if (!f.exists()) return m
-        try {
-            f.forEachLine { line ->
-                val s = line.split(';')
-                if (s.size == 8) {
-                    try {
-                        m[s[0].toLong()] = Cached(
-                            s[1].toLong(), s[2].toLong(), s[3].toInt(), s[4].toInt(),
-                            s[5].toLong(), s[6].toLong(), s[7].toInt()
-                        )
-                    } catch (_: Exception) { }
-                }
-            }
-        } catch (_: Exception) { }
-        return m
-    }
-
-    private fun saveCache(photos: List<Photo>) {
-        try {
-            cacheFile().bufferedWriter().use { w ->
-                for (p in photos) if (p.valid) {
-                    w.write("${p.id};${p.size};${p.modified};${p.w};${p.h};${p.h1};${p.h2};${p.lum}\n")
-                }
-            }
-        } catch (_: Exception) { }
-    }
-
-    // ---------------------------------------------------------------- Lista
+    // ---------------------------------------------------------------- Lista de grupos
 
     private fun loadThumb(p: Photo, iv: ImageView) {
         iv.tag = p.id
@@ -509,8 +591,8 @@ class MainActivity : Activity() {
         try {
             thumbPool.execute {
                 val bmp: Bitmap? = try {
-                    if (Build.VERSION.SDK_INT >= 29) contentResolver.loadThumbnail(p.uri, Size(256, 256), null)
-                    else decode(p.uri, 256)?.bmp
+                    if (Build.VERSION.SDK_INT >= 29) contentResolver.loadThumbnail(p.uri, Size(320, 320), null)
+                    else scanner.decode(p.uri, 256)?.bmp
                 } catch (_: Throwable) { null }
                 if (bmp != null) {
                     thumbs.put(p.id, bmp)
@@ -521,124 +603,395 @@ class MainActivity : Activity() {
     }
 
     inner class GroupAdapter : BaseAdapter() {
-        override fun getCount(): Int = groups.size
-        override fun getItem(position: Int): Any = groups[position]
+        override fun getCount(): Int = current.size
+        override fun getItem(position: Int): Any = current[position]
         override fun getItemId(position: Int): Long = position.toLong()
 
         override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val ctx = this@MainActivity
-            val outer = (convertView as? FrameLayout) ?: FrameLayout(ctx).apply {
+            val outer = (convertView as? FrameLayout) ?: FrameLayout(this@MainActivity).apply {
                 setPadding(0, dp(6), 0, dp(6))
-                addView(LinearLayout(ctx).apply {
-                    orientation = LinearLayout.VERTICAL
-                    background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(12).toFloat() }
-                    setPadding(dp(12), dp(10), dp(12), dp(12))
-                }, FrameLayout.LayoutParams(MATCH, WRAP))
+                clipToPadding = false
+                addView(card(), FrameLayout.LayoutParams(MATCH, WRAP))
             }
-            val card = outer.getChildAt(0) as LinearLayout
-            card.removeAllViews()
-            val g = groups[position]
-            card.addView(TextView(ctx).apply {
-                text = "Grupo ${position + 1} · ${g.photos.size} fotos · liberas ${mb(g.reclaim())}"
-                textSize = 14f
-                setTypeface(typeface, Typeface.BOLD)
-                setTextColor(DARK)
-            })
-            val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
-            for (p in g.photos) row.addView(cell(g, p))
-            card.addView(HorizontalScrollView(ctx).apply {
-                isHorizontalScrollBarEnabled = false
-                setPadding(0, dp(8), 0, 0)
-                addView(row)
-            })
+            val c = outer.getChildAt(0) as LinearLayout
+            c.removeAllViews()
+            fillCard(c, current[position], position)
             return outer
         }
     }
 
-    private fun cell(g: Group, p: Photo): View {
+    private fun fillCard(card: LinearLayout, g: Group, position: Int) {
+        val (label, color) = when (g.kind) {
+            Kind.COPIES -> "Copias" to cAccent
+            Kind.SIMILAR -> "Parecidas" to cTeal
+            Kind.BLURRY -> "Borrosas" to cAmber
+        }
+        val head = row()
+        head.addView(chip(label, color))
+        head.addView(
+            tv("${g.photos.size} fotos", 14f, cText, medium = true),
+            LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(10) }
+        )
+        val rec = g.reclaim()
+        head.addView(tv(if (rec > 0) "−${mb(rec)}" else "", 14f, cRed, medium = true))
+        card.addView(head)
+
+        val strip = row().apply { gravity = Gravity.TOP }
+        g.photos.forEachIndexed { i, p -> strip.addView(cell(g, p, i)) }
+        card.addView(HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(strip)
+        }, lp(MATCH, WRAP).apply { topMargin = dp(14) })
+
+        if (g.kind != Kind.BLURRY) {
+            val foot = row()
+            foot.addView(
+                tv(if (position == 0) "Toca para marcar · mantén para ampliar" else "", 12f, cSub),
+                LinearLayout.LayoutParams(0, WRAP, 1f)
+            )
+            foot.addView(tv("No son iguales", 13f, cSub, medium = true).apply {
+                setPadding(dp(12), dp(7), dp(12), dp(7))
+                background = ripple(round(withAlpha(cSub, 0x1A), 10), 10)
+                setOnClickListener { notSame(g) }
+            })
+            card.addView(foot, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+        } else if (position == 0) {
+            card.addView(
+                tv("Ordenadas de más a menos borrosa. Toca para marcar · mantén para ampliar.", 12f, cSub),
+                lp(MATCH, WRAP).apply { topMargin = dp(10) }
+            )
+        }
+    }
+
+    private fun cell(g: Group, p: Photo, index: Int): View {
         val del = p.id in g.delete
-        val side = dp(112)
+        val best = p.id == g.bestId
+        val side = dp(104)
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, dp(8), 0)
+            setPadding(0, 0, dp(10), 0)
+        }
+        val ring = when {
+            del -> cRed
+            g.kind == Kind.BLURRY -> Color.TRANSPARENT
+            else -> cGreen
         }
         val frame = FrameLayout(this).apply {
             setPadding(dp(3), dp(3), dp(3), dp(3))
-            background = GradientDrawable().apply {
-                setColor(if (del) RED else GREEN)
-                cornerRadius = dp(8).toFloat()
-            }
+            background = round(Color.TRANSPARENT, 16, 3, ring)
+            foreground = ripple(null, 16)
         }
         val iv = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            setBackgroundColor(Color.parseColor("#E0E0E0"))
+            background = round(cLine, 13)
+            clipToOutline = true
             alpha = if (del) 0.45f else 1f
         }
         frame.addView(iv, FrameLayout.LayoutParams(side, side))
-        frame.addView(TextView(this).apply {
-            text = if (del) "BORRAR" else "CONSERVAR"
-            textSize = 10f
-            setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.WHITE)
-            setBackgroundColor(if (del) RED else GREEN)
-            setPadding(dp(6), dp(2), dp(6), dp(2))
-        }, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.TOP or Gravity.START))
+        if (del || g.kind != Kind.BLURRY) {
+            frame.addView(tv(if (del) "✕" else "✓", 12f, Color.WHITE, bold = true).apply {
+                gravity = Gravity.CENTER
+                background = round(if (del) cRed else cGreen, 11)
+            }, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP or Gravity.END).apply {
+                setMargins(0, dp(6), dp(6), 0)
+            })
+        }
+        if (best) {
+            frame.addView(tv("★ Mejor", 10f, Color.WHITE, bold = true).apply {
+                background = round(cAccent, 8)
+                setPadding(dp(7), dp(3), dp(7), dp(3))
+            }, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.BOTTOM or Gravity.START).apply {
+                setMargins(dp(6), 0, 0, dp(6))
+            })
+        }
         col.addView(frame)
-        col.addView(TextView(this).apply {
-            text = (if (p.id == g.bestId) "★ Mejor\n" else "") + "${mp(p)} · ${mb(p.size)}"
-            textSize = 11f
-            setTextColor(if (p.id == g.bestId) GREEN else GREY)
+        col.addView(tv("${mp(p)} · ${mb(p.size)}", 11f, cText, medium = true).apply {
             maxWidth = side + dp(6)
-            setPadding(dp(2), dp(4), 0, 0)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(2), dp(7), 0, 0)
+        })
+        col.addView(tv(p.folder.ifEmpty { "—" }, 11f, cSub).apply {
+            maxWidth = side + dp(6)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+            setPadding(dp(2), dp(1), 0, 0)
         })
         loadThumb(p, iv)
         frame.setOnClickListener { toggle(g, p) }
-        frame.setOnLongClickListener { openPhoto(p); true }
+        frame.setOnLongClickListener { showDetail(g, index); true }
         return col
     }
 
-    private fun toggle(g: Group, p: Photo) {
-        if (p.id in g.delete) {
-            g.delete.remove(p.id)
-        } else {
-            if (g.photos.count { it.id !in g.delete } <= 1) {
-                toast("Tiene que quedar al menos una foto de cada grupo")
-                return
+    // ---------------------------------------------------------------- Visor a pantalla completa
+
+    private fun showDetail(g: Group, start: Int) {
+        if (g.photos.isEmpty()) return
+        var idx = start.coerceIn(0, g.photos.size - 1)
+        val d = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val iv = ImageView(this).apply { scaleType = ImageView.ScaleType.FIT_CENTER }
+        root.addView(iv, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val r = dp(24).toFloat()
+        val panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#E616181D"))
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
             }
-            g.delete.add(p.id)
+            setPadding(dp(18), dp(16), dp(18), dp(18))
         }
-        groupAdapter.notifyDataSetChanged()
-        updateSummary()
+        val title = tv("", 15f, Color.WHITE, medium = true).apply {
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.MIDDLE
+        }
+        val info = tv("", 13f, Color.parseColor("#B8BCC8")).apply { setLineSpacing(0f, 1.25f) }
+        val markBtn = pillButton("", true, cGreen) {}
+        val nav = row()
+        fun circle(s: String) = tv(s, 26f, Color.WHITE, medium = true).apply {
+            gravity = Gravity.CENTER
+            background = ripple(round(Color.parseColor("#33FFFFFF"), 24), 24)
+        }
+        val prev = circle("‹")
+        val next = circle("›")
+        val open = tv("Abrir en la galería", 13f, Color.WHITE, medium = true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        nav.addView(prev, LinearLayout.LayoutParams(dp(48), dp(48)))
+        nav.addView(open, LinearLayout.LayoutParams(0, WRAP, 1f))
+        nav.addView(next, LinearLayout.LayoutParams(dp(48), dp(48)))
+        panel.addView(title)
+        panel.addView(info, lp(MATCH, WRAP).apply { topMargin = dp(6) })
+        panel.addView(markBtn, lp(MATCH, WRAP).apply { topMargin = dp(14) })
+        panel.addView(nav, lp(MATCH, WRAP).apply { topMargin = dp(12) })
+        root.addView(panel, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
+
+        val close = tv("✕", 18f, Color.WHITE).apply {
+            gravity = Gravity.CENTER
+            background = ripple(round(Color.parseColor("#66000000"), 22), 22)
+            setOnClickListener { d.dismiss() }
+        }
+        root.addView(close, FrameLayout.LayoutParams(dp(44), dp(44), Gravity.TOP or Gravity.END).apply {
+            setMargins(0, dp(16), dp(16), 0)
+        })
+        root.setOnApplyWindowInsetsListener { _, insets ->
+            var top = 0
+            var bottom = 0
+            if (Build.VERSION.SDK_INT >= 30) {
+                val b = insets.getInsets(WindowInsets.Type.systemBars())
+                top = b.top; bottom = b.bottom
+            } else {
+                @Suppress("DEPRECATION")
+                run { top = insets.systemWindowInsetTop; bottom = insets.systemWindowInsetBottom }
+            }
+            root.setPadding(0, top, 0, 0)
+            panel.setPadding(dp(18), dp(16), dp(18), dp(18) + bottom)
+            insets
+        }
+
+        fun render() {
+            val p = g.photos[idx]
+            val del = p.id in g.delete
+            title.text = p.name
+            info.text = buildString {
+                append("${p.w} × ${p.h} px · ${mp(p)} · ${mb(p.size)}")
+                append("\n${fmtDate(p.taken)} · ${p.folder.ifEmpty { "—" }}")
+                if (p.sharp >= 0) append("\nNitidez: ${p.sharp.toInt()}")
+                if (p.id == g.bestId) append("   ★ La mejor del grupo")
+                append("\n${idx + 1} de ${g.photos.size}")
+            }
+            markBtn.text = if (del) "✕   Se borrará · tocar para conservar" else "✓   Se conserva · tocar para borrar"
+            styleFilled(markBtn, if (del) cRed else cGreen)
+            prev.alpha = if (idx > 0) 1f else 0.3f
+            next.alpha = if (idx < g.photos.size - 1) 1f else 0.3f
+            val id = p.id
+            iv.tag = id
+            val small = thumbs.get(id)
+            if (small != null) iv.setImageBitmap(small) else iv.setImageDrawable(null)
+            try {
+                thumbPool.execute {
+                    val b = try { scanner.decodeForView(p.uri) } catch (_: Throwable) { null }
+                    if (b != null) ui { if (iv.tag == id) iv.setImageBitmap(b) }
+                }
+            } catch (_: Exception) { }
+        }
+
+        fun go(delta: Int) {
+            val n = idx + delta
+            if (n in 0 until g.photos.size) { idx = n; render() }
+        }
+
+        markBtn.setOnClickListener { if (toggle(g, g.photos[idx])) render() }
+        prev.setOnClickListener { go(-1) }
+        next.setOnClickListener { go(1) }
+        open.setOnClickListener {
+            try {
+                startActivity(
+                    Intent(Intent.ACTION_VIEW).setDataAndType(g.photos[idx].uri, "image/*")
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                )
+            } catch (_: Exception) { toast("No hay ningún visor de imágenes instalado") }
+        }
+        val gd = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onDown(e: MotionEvent): Boolean = true
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (abs(velocityX) > abs(velocityY) && abs(velocityX) > 600) {
+                    go(if (velocityX < 0) 1 else -1)
+                    return true
+                }
+                return false
+            }
+        })
+        iv.setOnTouchListener { _, ev -> gd.onTouchEvent(ev) }
+
+        d.setContentView(root)
+        d.setOnDismissListener { groupAdapter.notifyDataSetChanged() }
+        d.show()
+        render()
     }
 
-    private fun openPhoto(p: Photo) {
-        try {
-            startActivity(
-                Intent(Intent.ACTION_VIEW).setDataAndType(p.uri, "image/*")
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            )
-        } catch (_: Exception) {
-            toast("No hay ningún visor de imágenes instalado")
+    // ---------------------------------------------------------------- Ajustes
+
+    private fun showSettings() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(4), dp(22), dp(8))
         }
+        fun section(t: String) {
+            box.addView(tv(t.uppercase(), 12f, cAccent, bold = true).apply { letterSpacing = 0.06f },
+                lp(MATCH, WRAP).apply { topMargin = dp(18) })
+        }
+        fun spinner(items: Array<String>, sel: Int): Spinner {
+            val sp = Spinner(this)
+            sp.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, items)
+            sp.setSelection(sel.coerceIn(0, items.size - 1))
+            box.addView(sp, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+            return sp
+        }
+        fun check(t: String, v: Boolean): CheckBox {
+            val cb = CheckBox(this)
+            cb.text = t
+            cb.isChecked = v
+            cb.textSize = 14f
+            cb.setTextColor(cText)
+            cb.buttonTintList = csl(cAccent)
+            box.addView(cb, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+            return cb
+        }
+
+        section("Dónde buscar")
+        val scopeSp = spinner(Settings.SCOPES, settings.scope)
+        var chosen = settings.folders
+        var excl = settings.excluded
+        val folderRow = row()
+        val chooseBtn = smallPill("Carpetas elegidas: ${chosen.size}") {}
+        val exclBtn = smallPill("Excluidas: ${excl.size}") {}
+        chooseBtn.setOnClickListener {
+            pickFolders("Buscar solo en", chosen) {
+                chosen = it
+                chooseBtn.text = "Carpetas elegidas: ${it.size}"
+                if (it.isNotEmpty()) scopeSp.setSelection(2)
+            }
+        }
+        exclBtn.setOnClickListener {
+            pickFolders("No buscar en", excl) {
+                excl = it
+                exclBtn.text = "Excluidas: ${it.size}"
+            }
+        }
+        folderRow.addView(chooseBtn)
+        folderRow.addView(exclBtn, lp(WRAP, WRAP).apply { leftMargin = dp(8) })
+        box.addView(folderRow, lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        val minSp = spinner(Settings.MIN_LABELS, max(0, Settings.MIN_KB.indexOf(settings.minKb)))
+
+        section("Qué cuenta como repetida")
+        val winSp = spinner(Settings.WINDOW_LABELS, settings.timeWindow)
+        val rotCb = check("Detectar también fotos giradas o volteadas", settings.rotated)
+
+        section("Qué foto conservar")
+        val keepSp = spinner(Settings.KEEP_LABELS, settings.keepRule)
+        val camCb = check("Preferir la original de la cámara frente a copias (WhatsApp, descargas…)", settings.preferCamera)
+
+        section("Extras")
+        val blurCb = check("Buscar también fotos borrosas", settings.blurry)
+        box.addView(smallPill("Volver a mostrar los grupos «No son iguales»") {
+            scanner.clearIgnored()
+            toast("Hecho. Se tendrán en cuenta en la próxima búsqueda.")
+        }, lp(WRAP, WRAP).apply { topMargin = dp(12) })
+
+        AlertDialog.Builder(this)
+            .setTitle("Ajustes")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Guardar") { _, _ ->
+                val newMin = Settings.MIN_KB[minSp.selectedItemPosition.coerceIn(0, Settings.MIN_KB.size - 1)]
+                val rescan = scopeSp.selectedItemPosition != settings.scope || chosen != settings.folders ||
+                    excl != settings.excluded || newMin != settings.minKb || (blurCb.isChecked && !settings.blurry)
+                val regroup = winSp.selectedItemPosition != settings.timeWindow || rotCb.isChecked != settings.rotated
+                val remark = keepSp.selectedItemPosition != settings.keepRule || camCb.isChecked != settings.preferCamera
+
+                settings.scope = scopeSp.selectedItemPosition
+                settings.folders = chosen
+                settings.excluded = excl
+                settings.minKb = newMin
+                settings.timeWindow = winSp.selectedItemPosition
+                settings.rotated = rotCb.isChecked
+                settings.keepRule = keepSp.selectedItemPosition
+                settings.preferCamera = camCb.isChecked
+                settings.blurry = blurCb.isChecked
+                if (!blurCb.isChecked) blurGroups = mutableListOf()
+
+                when {
+                    !scanned || busy -> { groupAdapter.notifyDataSetChanged(); updateUi() }
+                    rescan -> ensurePerms { startScan() }
+                    regroup -> recluster()
+                    remark -> {
+                        dupGroups.forEach { scanner.remark(it, settings) }
+                        groupAdapter.notifyDataSetChanged()
+                        updateUi()
+                    }
+                    else -> { groupAdapter.notifyDataSetChanged(); updateUi() }
+                }
+            }
+            .show()
     }
 
-    private fun updateSummary() {
-        val n = groups.sumOf { it.delete.size }
-        val bytes = groups.sumOf { it.reclaim() }
-        status.text = if (groups.isEmpty()) "No he encontrado fotos repetidas."
-        else "${groups.size} grupos · $n fotos marcadas · ${mb(bytes)}\n" +
-            "Toca una foto para cambiar su marca; mantén pulsado para verla en grande."
-        deleteBtn.isEnabled = n > 0
-        deleteBtn.text = if (n > 0) "$trashVerb $n fotos (${mb(bytes)})" else trashVerb
+    private fun pickFolders(title: String, selected: Set<String>, cb: (Set<String>) -> Unit) {
+        ensurePerms {
+            Thread {
+                val fs = try { scanner.folders() } catch (_: Exception) { emptyList() }
+                ui {
+                    if (fs.isEmpty()) {
+                        toast("No he encontrado carpetas con fotos")
+                    } else {
+                        val names = fs.map { it.first }
+                        val checked = BooleanArray(names.size) { names[it] in selected }
+                        AlertDialog.Builder(this@MainActivity)
+                            .setTitle(title)
+                            .setMultiChoiceItems(fs.map { "${it.first}  (${it.second})" }.toTypedArray(), checked) { _, w, c ->
+                                checked[w] = c
+                            }
+                            .setNegativeButton("Cancelar", null)
+                            .setPositiveButton("Aceptar") { _, _ ->
+                                cb(names.filterIndexed { i, _ -> checked[i] }.toSet())
+                            }
+                            .show()
+                    }
+                }
+            }.start()
+        }
     }
 
     // ---------------------------------------------------------------- Borrado
 
     private fun deleteSelected() {
-        val targets = groups.flatMap { g -> g.photos.filter { it.id in g.delete } }
+        val seen = HashSet<Long>()
+        val targets = current.flatMap { g -> g.photos.filter { it.id in g.delete } }.filter { seen.add(it.id) }
         if (targets.isEmpty()) return
         if (Build.VERSION.SDK_INT >= 30) {
-            // Papelera del sistema: recuperable durante 30 días. Android pide confirmación propia.
             try {
                 val pi = MediaStore.createTrashRequest(contentResolver, targets.map { it.uri }, true)
                 pendingTrash = targets.map { it.id }.toSet()
@@ -674,21 +1027,24 @@ class MainActivity : Activity() {
     private fun removeDone(ids: Set<Long>, verb: String) {
         var freed = 0L
         var count = 0
-        for (g in groups) {
+        val seen = HashSet<Long>()
+        for (g in dupGroups + blurGroups) {
             val iter = g.photos.iterator()
             while (iter.hasNext()) {
                 val p = iter.next()
                 if (p.id in ids) {
-                    freed += p.size
-                    count++
+                    if (seen.add(p.id)) { freed += p.size; count++ }
                     iter.remove()
                     g.delete.remove(p.id)
                 }
             }
         }
-        groups.removeAll { it.photos.size < 2 }
+        dupGroups.removeAll { it.photos.size < 2 }
+        for (g in dupGroups) if (g.photos.all { it.id in g.delete }) scanner.remark(g, settings)
+        blurGroups.removeAll { it.photos.isEmpty() }
+        allPhotos = allPhotos.filter { it.id !in ids }
         groupAdapter.notifyDataSetChanged()
-        updateSummary()
+        updateUi()
         toast("$verb $count fotos · ${mb(freed)} liberados")
     }
 }
