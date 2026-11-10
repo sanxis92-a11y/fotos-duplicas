@@ -5,6 +5,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,3 +28,9 @@ jobs:
         with:
           name: FotosDuplicadas-apk
           path: FotosDuplicadas.apk
+      - name: Publicar descarga directa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest FotosDuplicadas.apk --title "Fotos Duplicadas (última versión)" --notes "APK compilada automáticamente desde main."
