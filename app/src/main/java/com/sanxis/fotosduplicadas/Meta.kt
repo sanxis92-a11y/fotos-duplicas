@@ -44,6 +44,27 @@ object Meta {
         return cr.openInputStream(uri)
     }
 
+    /** Paquete XMP del archivo (nombres de personas, caras etiquetadas…), o null. */
+    fun xmpOf(cr: ContentResolver, uri: Uri): String? {
+        try {
+            open(cr, uri)?.use { ins ->
+                val buf = ByteArray(1024 * 1024)
+                var n = 0
+                while (n < buf.size) {
+                    val r = ins.read(buf, n, buf.size - n)
+                    if (r <= 0) break
+                    n += r
+                }
+                Xmp.extract(buf.copyOf(n))?.let { return it }
+            }
+        } catch (_: Throwable) { }
+        return try { open(cr, uri)?.use { ExifInterface(it).getAttribute(ExifInterface.TAG_XMP) } } catch (_: Throwable) { null }
+    }
+
+    fun orientation(cr: ContentResolver, uri: Uri): Int = try {
+        cr.openInputStream(uri)?.use { ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, 1) } ?: 1
+    } catch (_: Throwable) { 1 }
+
     /** Lista (etiqueta, valor) legible en español. Lo vacío no aparece. */
     fun read(cr: ContentResolver, p: Photo): List<Pair<String, String>> {
         val out = ArrayList<Pair<String, String>>()
@@ -90,16 +111,48 @@ object Meta {
         add("Software", a(ExifInterface.TAG_SOFTWARE))
         add("Propietario", a(ExifInterface.TAG_CAMERA_OWNER_NAME))
         add("Nº de serie", a(ExifInterface.TAG_BODY_SERIAL_NUMBER))
+
+        // XMP: nombres que guardan Lightroom, Picasa, digiKam, Windows Fotos…
+        val x = xmpOf(cr, p.uri)
+        if (x != null) {
+            val names = Xmp.names(x)
+            add("👥 Personas etiquetadas en el archivo", names.joinToString(", ").ifEmpty { null })
+            add("Autor (XMP)", Xmp.creator(x))
+            if (Xmp.hasLocation(x)) add("📍 Ubicación (XMP)", "Sí, el archivo guarda también lugar o coordenadas")
+        }
         return out
     }
 
-    /** Edita el EXIF del archivo original. Lanza excepción si el formato no se puede escribir (p. ej. HEIC). */
-    fun edit(cr: ContentResolver, uri: Uri, change: (ExifInterface) -> Unit) {
+    /**
+     * Edita los metadatos del archivo original. Lanza excepción si el formato no se puede escribir (p. ej. HEIC).
+     * scrubNames / scrubLocation: limpia también la parte XMP (nombres, caras etiquetadas, ubicación).
+     */
+    fun edit(
+        cr: ContentResolver, uri: Uri, change: (ExifInterface) -> Unit,
+        scrubNames: Boolean = false, scrubLocation: Boolean = false
+    ) {
+        val scrub = scrubNames || scrubLocation
         val pfd = cr.openFileDescriptor(uri, "rw") ?: throw IOException("No se pudo abrir el archivo")
         pfd.use {
             val e = ExifInterface(it.fileDescriptor)
             change(e)
+            if (scrub) {
+                try {
+                    val x = e.getAttribute(ExifInterface.TAG_XMP)
+                    if (x != null) {
+                        val y = Xmp.sanitize(x, scrubNames, scrubLocation)
+                        if (y != x) e.setAttribute(ExifInterface.TAG_XMP, y)
+                    }
+                } catch (_: Throwable) { }
+            }
             e.saveAttributes()
+        }
+        // JPEG: se limpia directamente el bloque XMP del archivo (la imagen se copia tal cual)
+        if (scrub) {
+            val bytes = (try { open(cr, uri) } catch (_: Throwable) { null } ?: cr.openInputStream(uri))
+                ?.use { it.readBytes() } ?: return
+            val out = Xmp.rewriteJpeg(bytes) { Xmp.sanitize(it, scrubNames, scrubLocation) } ?: return
+            cr.openOutputStream(uri, "rwt")?.use { it.write(out) } ?: throw IOException("No se pudo guardar")
         }
     }
 

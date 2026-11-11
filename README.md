@@ -31,6 +31,12 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - En Ajustes: cambiar el código, desactivar la calculadora y disfrazar icono y nombre como «Calculadora».
 - Si sales de la app más de 30 segundos, vuelve a pedir el código; la vista previa en recientes se oculta (Android 13+).
 
+## Nombres en los metadatos (v1.8)
+- Lee las caras etiquetadas por otros programas (XMP de Lightroom, Picasa, digiKam, Windows Fotos; IPTC PersonInImage) y las muestra en ⓘ Datos.
+- Usa esos nombres para nombrar automáticamente a las personas en Explorar (si no les has puesto otro).
+- «Quitar ubicación» y «Quitar datos personales» limpian también el XMP, respetando fotos en movimiento y HDR.
+- Pruebas automáticas del XMP en `app/src/test` (se ejecutan en cada compilación).
+
 ## Carpetas (v1.5)
 - Pestaña **Carpetas**: todas las carpetas de fotos del móvil; abre cualquiera para ver, mover o borrar.
 - **Mover** desde cualquier rejilla (categoría, persona, carpeta) a una carpeta existente o nueva.

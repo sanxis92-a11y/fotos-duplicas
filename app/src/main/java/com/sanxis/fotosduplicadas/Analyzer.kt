@@ -138,6 +138,7 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                 .take(8)
                 .map { it.text }
             p.faces = detectFaces(p, bmp)
+            applyXmpNames(p)
             bmp.recycle()
             p.hasGps = if (locAllowed) readGps(p.uri) else false
             p.gpsChecked = locAllowed
@@ -152,6 +153,7 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         try {
             val bmp = scanner.decodeUpright(p.uri, 1024) ?: return
             p.faces = detectFaces(p, bmp)
+            applyXmpNames(p)
             bmp.recycle()
         } catch (_: Throwable) { }
     }
@@ -224,6 +226,56 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         for (x in v) mx = max(mx, abs(x))
         if (mx <= 0f) return null
         return ByteArray(v.size) { (v[it] / mx * 127f).roundToInt().coerceIn(-127, 127).toByte() }
+    }
+
+    // ------------------------------------------------------------ Nombres guardados en el archivo (XMP)
+
+    /** Para fotos ya analizadas: lee solo los nombres XMP y los asigna a sus caras. */
+    fun readXmpNames(p: Photo) = applyXmpNames(p)
+
+    private fun applyXmpNames(p: Photo) {
+        p.xmpChecked = true
+        val faces = p.faces
+        if (faces.isEmpty()) return
+        val xmp = try { Meta.xmpOf(ctx.contentResolver, p.uri) } catch (_: Throwable) { null } ?: return
+        val regions = Xmp.regions(xmp)
+        if (regions.isNotEmpty()) {
+            // Según el programa, el recuadro viene sobre la foto girada o sin girar: se prueban las dos
+            val orient = Meta.orientation(ctx.contentResolver, p.uri)
+            val asIs = matchRegions(regions, faces, 1)
+            val turned = if (orient == 3 || orient == 6 || orient == 8) matchRegions(regions, faces, orient) else emptyMap()
+            val best = if (turned.size > asIs.size) turned else asIs
+            for ((i, n) in best) faces[i].name = n
+        } else {
+            val people = Xmp.personInImage(xmp)
+            val withEmb = faces.indices.filter { faces[it].emb != null }
+            if (people.size == 1 && withEmb.size == 1) faces[withEmb[0]].name = people[0]
+        }
+    }
+
+    private fun matchRegions(regions: List<Xmp.Region>, faces: List<FaceInfo>, orient: Int): Map<Int, String> {
+        val out = HashMap<Int, String>()
+        for (r in regions) {
+            val (cx, cy) = when (orient) {
+                6 -> (1f - r.cy) to r.cx
+                3 -> (1f - r.cx) to (1f - r.cy)
+                8 -> r.cy to (1f - r.cx)
+                else -> r.cx to r.cy
+            }
+            var best = -1
+            var bd = Float.MAX_VALUE
+            for (i in faces.indices) {
+                if (i in out) continue
+                val f = faces[i]
+                val fx = (f.l + f.r) / 2f
+                val fy = (f.t + f.b) / 2f
+                val size = max(f.r - f.l, f.b - f.t)
+                val d = sqrt((cx - fx) * (cx - fx) + (cy - fy) * (cy - fy))
+                if (d < size * 0.75f && d < bd) { bd = d; best = i }
+            }
+            if (best >= 0) out[best] = r.name
+        }
+        return out
     }
 
     /** Lee si la foto tiene coordenadas GPS (requiere permiso de ubicación de fotos en Android 10+). */
@@ -375,7 +427,10 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         val raw = groups.map { idx ->
             val m = idx.map { faces[it] }.sortedByDescending { it.f.area }
             val keys = m.map { it.key }
-            val name = keys.firstNotNullOfOrNull { names[it] } ?: ""
+            // Nombre: el que pusiste en la app; si no, el más repetido en las caras etiquetadas del archivo
+            val name = keys.firstNotNullOfOrNull { names[it] }
+                ?: m.mapNotNull { it.f.name }.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
+                ?: ""
             Person(keys, name, m.map { it.p to it.f })
         }
         // Personas con el mismo nombre se unen (así se pueden fusionar renombrando)
@@ -397,7 +452,7 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         try {
             f.forEachLine { line ->
                 val s = line.split(';')
-                if (s.size == 6) s[0].toLongOrNull()?.let { m[it] = s }
+                if (s.size == 6 || s.size == 7) s[0].toLongOrNull()?.let { m[it] = s }
             }
         } catch (_: Exception) { }
         return m
@@ -416,8 +471,11 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                 FaceInfo(
                     q[0].toFloat(), q[1].toFloat(), q[2].toFloat(), q[3].toFloat(),
                     if (q.size > 4 && q[4].isNotEmpty()) Base64.decode(q[4], Base64.NO_WRAP) else null
-                )
+                ).apply {
+                    if (q.size > 5 && q[5].isNotEmpty()) name = String(Base64.decode(q[5], Base64.NO_WRAP), Charsets.UTF_8)
+                }
             }
+            p.xmpChecked = s.size >= 7 && s[6] == "1"
             p.contentDone = true
             if (engine.ready && s[3] != FACE_VERSION) 2 else 1
         } catch (_: Exception) { 0 }
@@ -434,10 +492,11 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                 for (p in photos) if (p.contentDone) {
                     val faces = p.faces.joinToString("|") { f ->
                         val e = f.emb?.let { Base64.encodeToString(it, Base64.NO_WRAP) } ?: ""
-                        "${f.l},${f.t},${f.r},${f.b},$e"
+                        val nm = f.name?.let { Base64.encodeToString(it.toByteArray(Charsets.UTF_8), Base64.NO_WRAP) } ?: ""
+                        "${f.l},${f.t},${f.r},${f.b},$e,$nm"
                     }
                     val gps = if (!p.gpsChecked) "?" else if (p.hasGps) "1" else "0"
-                    w.write("${p.id};${p.modified};$gps;$model;${p.labels.joinToString(",")};$faces\n")
+                    w.write("${p.id};${p.modified};$gps;$model;${p.labels.joinToString(",")};$faces;${if (p.xmpChecked) 1 else 0}\n")
                 }
             }
         } catch (_: Exception) { }

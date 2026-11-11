@@ -11,8 +11,8 @@ android {
         applicationId = "com.sanxis.fotosduplicadas"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.7"
+        versionCode = 9
+        versionName = "1.8"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -33,4 +33,6 @@ dependencies {
     // Caras: modelos InsightFace (buffalo_s) con ONNX Runtime
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
+
+    testImplementation("junit:junit:4.13.2")
 }

@@ -1553,6 +1553,7 @@ class MainActivity : Activity() {
                                 p.hasGps = analyzer.readGps(p.uri)
                                 p.gpsChecked = true
                             }
+                            if (!p.xmpChecked) analyzer.readXmpNames(p)
                         }
                     }
                     if (i % 10 == 0) {
@@ -1753,7 +1754,7 @@ class MainActivity : Activity() {
 
         fun stripGps() {
             val ps = selected()
-            performEdit(ps, "Ubicación quitada", { e -> Meta.clear(e, Meta.GPS_TAGS) }) {
+            performEdit(ps, "Ubicación quitada", { e -> Meta.clear(e, Meta.GPS_TAGS) }, scrub = 1) {
                 ps.forEach { it.hasGps = false }
                 g.delete.clear()
                 refresh()
@@ -1766,7 +1767,8 @@ class MainActivity : Activity() {
                 .setTitle("Quitar datos personales")
                 .setMessage(
                     "Se borrarán de ${ps.size} ${if (ps.size == 1) "foto" else "fotos"}: ubicación GPS, marca y modelo " +
-                        "de la cámara, números de serie, propietario, autor, copyright, software, descripción y comentarios. " +
+                        "de la cámara, números de serie, propietario, autor, copyright, software, descripción, comentarios " +
+                        "y los nombres de personas y caras etiquetadas guardados por otros programas (XMP). " +
                         "La imagen no cambia."
                 )
                 .setNegativeButton("Cancelar", null)
@@ -1774,7 +1776,7 @@ class MainActivity : Activity() {
                     performEdit(ps, "Datos personales quitados", { e ->
                         Meta.clear(e, Meta.GPS_TAGS)
                         Meta.clear(e, Meta.PERSONAL_TAGS)
-                    }) {
+                    }, scrub = 2) {
                         ps.forEach { it.hasGps = false }
                         g.delete.clear()
                         refresh()
@@ -2215,7 +2217,7 @@ class MainActivity : Activity() {
             box.addView(smallPill(label) { dlg.dismiss(); f() }, lp(MATCH, WRAP).apply { topMargin = dp(8) })
         }
         act("📍  Quitar ubicación") {
-            performEdit(listOf(p), "Ubicación quitada", { e -> Meta.clear(e, Meta.GPS_TAGS) }) {
+            performEdit(listOf(p), "Ubicación quitada", { e -> Meta.clear(e, Meta.GPS_TAGS) }, scrub = 1) {
                 p.hasGps = false
                 renderExplore()
             }
@@ -2224,7 +2226,7 @@ class MainActivity : Activity() {
             performEdit(listOf(p), "Datos personales quitados", { e ->
                 Meta.clear(e, Meta.GPS_TAGS)
                 Meta.clear(e, Meta.PERSONAL_TAGS)
-            }) {
+            }, scrub = 2) {
                 p.hasGps = false
                 renderExplore()
             }
@@ -2283,7 +2285,10 @@ class MainActivity : Activity() {
     }
 
     /** Escribe en los archivos originales. En Android 11+ el sistema pide permiso una vez para todo el lote. */
-    private fun performEdit(ps: List<Photo>, msg: String, change: (ExifInterface) -> Unit, after: () -> Unit = {}) {
+    /** scrub: 0 = nada, 1 = ubicación también en XMP, 2 = ubicación + nombres en XMP. */
+    private fun performEdit(
+        ps: List<Photo>, msg: String, change: (ExifInterface) -> Unit, scrub: Int = 0, after: () -> Unit = {}
+    ) {
         if (ps.isEmpty()) return
         val job: () -> Unit = {
             if (ps.size > 5) toast("Guardando cambios en ${ps.size} fotos…")
@@ -2293,7 +2298,7 @@ class MainActivity : Activity() {
                 var rec: RecoverableSecurityException? = null
                 for (p in ps) {
                     try {
-                        Meta.edit(contentResolver, p.uri, change)
+                        Meta.edit(contentResolver, p.uri, change, scrubNames = scrub >= 2, scrubLocation = scrub >= 1)
                         ok++
                     } catch (e: RecoverableSecurityException) {
                         rec = e
@@ -2305,7 +2310,7 @@ class MainActivity : Activity() {
                 val r = rec
                 ui {
                     if (r != null && ok == 0) {
-                        pendingWrite = { performEdit(ps, msg, change, after) }
+                        pendingWrite = { performEdit(ps, msg, change, scrub, after) }
                         pendingWriteCancel = null
                         try {
                             awaitingResult = true; startIntentSenderForResult(r.userAction.actionIntent.intentSender, REQ_WRITE, null, 0, 0, 0)

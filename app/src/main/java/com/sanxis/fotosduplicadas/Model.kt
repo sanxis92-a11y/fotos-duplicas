@@ -26,6 +26,7 @@ class Photo(
     var hasGps = false
     /** Carpeta relativa a la memoria, p. ej. "DCIM/Camera/" o "Pictures/Viajes/". */
     var relPath = ""
+    var xmpChecked = false   // nombres XMP ya leídos
     var gpsChecked = false   // false si no se pudo comprobar (sin permiso de ubicación de fotos)
     var contentDone = false
 
@@ -35,6 +36,8 @@ class Photo(
 
 /** Cara detectada: caja normalizada 0..1 sobre la imagen ya enderezada y su huella (int8, normalizada). */
 class FaceInfo(val l: Float, val t: Float, val r: Float, val b: Float, val emb: ByteArray?) {
+    /** Nombre guardado en el propio archivo (caras etiquetadas por otro programa). */
+    var name: String? = null
     val area: Float get() = (r - l) * (b - t)
 }
 
