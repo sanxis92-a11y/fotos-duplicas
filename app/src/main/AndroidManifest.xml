@@ -8,6 +8,8 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
     <!-- Para leer la ubicación GPS guardada en las fotos (Android 10+) -->
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
+    <!-- Opcional (Android 12+): mover/editar fotos sin confirmar cada vez; lo concede el usuario en Ajustes -->
+    <uses-permission android:name="android.permission.MANAGE_MEDIA" tools:ignore="ProtectedPermissions" />
 
     <!-- Las librerías de ML Kit piden Internet para estadísticas: se elimina a la fuerza -->
     <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />

@@ -18,6 +18,7 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -129,6 +130,18 @@ class MainActivity : Activity() {
     @Volatile private var exploring = false
     private var page = 0
     private var pendingWrite: (() -> Unit)? = null
+    private var pendingWriteCancel: (() -> Unit)? = null
+    // Carpetas
+    private lateinit var organizer: Organizer
+    private var allGallery: List<Photo> = emptyList()
+    private var galleryLoaded = false
+    private var galleryLoading = false
+    private var organizing = false
+    private lateinit var foldersPage: ScrollView
+    private lateinit var foldersBox: LinearLayout
+    private lateinit var pageFolders: TextView
+    private var folderProgress: ProgressBar? = null
+    private var folderSub: TextView? = null
     private var lastStop = 0L
     private var awaitingResult = false
     private var gridListener: ((Set<Long>) -> Unit)? = null
@@ -294,8 +307,10 @@ class MainActivity : Activity() {
         }
         pageClean = tabItem { selectPage(0) }
         pageExplore = tabItem { selectPage(1) }
+        pageFolders = tabItem { selectPage(2) }
         seg.addView(pageClean, LinearLayout.LayoutParams(0, WRAP, 1f))
         seg.addView(pageExplore, LinearLayout.LayoutParams(0, WRAP, 1f))
+        seg.addView(pageFolders, LinearLayout.LayoutParams(0, WRAP, 1f))
         topBar.addView(seg, lp(MATCH, WRAP).apply { topMargin = dp(14) })
         root.addView(topBar, MATCH, WRAP)
 
@@ -334,6 +349,17 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         pages.addView(explorePage, FrameLayout.LayoutParams(MATCH, MATCH))
+        foldersBox = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(4), dp(16), dp(24))
+        }
+        foldersPage = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(foldersBox)
+            visibility = View.GONE
+        }
+        pages.addView(foldersPage, FrameLayout.LayoutParams(MATCH, MATCH))
+        organizer = Organizer(this)
         root.addView(pages, LinearLayout.LayoutParams(MATCH, 0, 1f))
         analyzer = ContentAnalyzer(this, scanner)
         selectPage(0)
@@ -345,6 +371,11 @@ class MainActivity : Activity() {
     override fun onStop() {
         super.onStop()
         lastStop = System.currentTimeMillis()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (page == 2 && !organizing) renderFolders()   // p. ej. al volver de dar el permiso de multimedia
     }
 
     override fun onRestart() {
@@ -1158,11 +1189,14 @@ class MainActivity : Activity() {
 
     private fun selectPage(p: Int) {
         page = p
-        styleTab(pageClean, p == 0, "🧹  Limpiar")
-        styleTab(pageExplore, p == 1, "🔎  Explorar")
+        styleTab(pageClean, p == 0, "🧹 Limpiar")
+        styleTab(pageExplore, p == 1, "🔎 Explorar")
+        styleTab(pageFolders, p == 2, "📁 Carpetas")
         cleanPage.visibility = if (p == 0) View.VISIBLE else View.GONE
         explorePage.visibility = if (p == 1) View.VISIBLE else View.GONE
+        foldersPage.visibility = if (p == 2) View.VISIBLE else View.GONE
         if (p == 1) renderExplore()
+        if (p == 2) renderFolders()
     }
 
     private fun sectionTitle(t: String) = tv(t, 17f, cText, bold = true)
@@ -1551,7 +1585,16 @@ class MainActivity : Activity() {
 
     // ---------------------------------------------------------------- Rejilla de fotos
 
-    private fun showGrid(title: String, photos: List<Photo>, person: Person? = null) {
+    /**
+     * Rejilla de fotos con selección.
+     * person: si viene de una persona (permite «No es esta persona»).
+     * folderRel: si es una carpeta (las fotos movidas fuera desaparecen de la rejilla).
+     * pickTarget: modo «elegir fotos para mover a esta carpeta».
+     */
+    private fun showGrid(
+        title: String, photos: List<Photo>, person: Person? = null,
+        folderRel: String? = null, pickTarget: String? = null
+    ) {
         val g = Group(Kind.BROWSE, photos.toMutableList(), -1L)
         val d = Dialog(
             this,
@@ -1612,16 +1655,20 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
         val delBtn = pillButton("", true, cRed) {}
-        val gpsBtn = pillButton("📍 Quitar GPS", false, cAccent) {}
-        val cleanBtn = pillButton(if (person != null) "🙅 No es" else "🧽 Quitar datos", false, cAccent) {}
-        for (b in listOf(delBtn, gpsBtn, cleanBtn)) {
+        val moveBtn = pillButton("📁 Mover", pickTarget != null, cAccent) {}
+        val moreBtn = pillButton("⋯ Más", false, cAccent) {}
+        for (b in listOf(delBtn, moveBtn, moreBtn)) {
             b.textSize = 13f
             b.setPadding(dp(6), dp(13), dp(6), dp(13))
             b.maxLines = 1
         }
-        bar.addView(delBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
-        bar.addView(gpsBtn, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) })
-        bar.addView(cleanBtn, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) })
+        if (pickTarget == null) {
+            bar.addView(delBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+            bar.addView(moveBtn, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) })
+            bar.addView(moreBtn, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) })
+        } else {
+            bar.addView(moveBtn, LinearLayout.LayoutParams(0, WRAP, 1f))
+        }
         root.addView(bar, MATCH, WRAP)
 
         lateinit var adapter: BaseAdapter
@@ -1632,6 +1679,7 @@ class MainActivity : Activity() {
             allBtn.text = if (n > 0 && n == g.photos.size) "Ninguna" else "Todas"
             bar.visibility = if (n > 0) View.VISIBLE else View.GONE
             delBtn.text = "🗑 Borrar $n"
+            if (pickTarget != null) moveBtn.text = "📁 Mover $n a «${Organizer.lastSegment(pickTarget)}»"
             adapter.notifyDataSetChanged()
         }
         adapter = object : BaseAdapter() {
@@ -1679,7 +1727,28 @@ class MainActivity : Activity() {
         }
         fun selected() = g.photos.filter { it.id in g.delete }
         delBtn.setOnClickListener { deletePhotos(selected()) }
-        gpsBtn.setOnClickListener {
+
+        fun afterMove(moved: List<Photo>) {
+            if (pickTarget != null) { d.dismiss(); return }
+            if (folderRel != null) {
+                val gone = moved.filter { !it.relPath.equals(folderRel, true) }.map { it.id }.toSet()
+                g.photos.removeAll { it.id in gone }
+            }
+            g.delete.clear()
+            refresh()
+        }
+        moveBtn.setOnClickListener {
+            val ps = selected()
+            if (pickTarget != null) {
+                performMoves(ps.map { it to pickTarget }) { afterMove(ps) }
+            } else {
+                chooseFolder("Mover ${ps.size} ${if (ps.size == 1) "foto" else "fotos"} a…") { target ->
+                    performMoves(ps.map { it to target }) { afterMove(ps) }
+                }
+            }
+        }
+
+        fun stripGps() {
             val ps = selected()
             performEdit(ps, "Ubicación quitada", { e -> Meta.clear(e, Meta.GPS_TAGS) }) {
                 ps.forEach { it.hasGps = false }
@@ -1688,20 +1757,8 @@ class MainActivity : Activity() {
                 renderExplore()
             }
         }
-        cleanBtn.setOnClickListener {
+        fun stripPersonal() {
             val ps = selected()
-            if (person != null) {
-                // Corrección: estas caras no son de esta persona
-                val ids = ps.map { it.id }.toSet()
-                val keys = person.keys.filterIndexed { i, _ -> person.faces[i].first.id in ids }
-                excludeFaces(keys)
-                g.photos.removeAll { it.id in ids }
-                g.delete.clear()
-                refresh()
-                regroupPeople()
-                toast("Quitadas de esta persona (${ids.size})")
-                return@setOnClickListener
-            }
             AlertDialog.Builder(this)
                 .setTitle("Quitar datos personales")
                 .setMessage(
@@ -1723,6 +1780,31 @@ class MainActivity : Activity() {
                 }
                 .show()
         }
+        fun notThisPerson() {
+            val pr = person ?: return
+            val ids = selected().map { it.id }.toSet()
+            val keys = pr.keys.filterIndexed { i, _ -> pr.faces[i].first.id in ids }
+            excludeFaces(keys)
+            g.photos.removeAll { it.id in ids }
+            g.delete.clear()
+            refresh()
+            regroupPeople()
+            toast("Quitadas de esta persona (${ids.size})")
+        }
+        moreBtn.setOnClickListener {
+            val labels = mutableListOf("📍  Quitar ubicación", "🧽  Quitar datos personales")
+            if (person != null) labels += "🙅  No es esta persona"
+            AlertDialog.Builder(this)
+                .setTitle("${g.delete.size} seleccionadas")
+                .setItems(labels.toTypedArray()) { _, which ->
+                    when (which) {
+                        0 -> stripGps()
+                        1 -> stripPersonal()
+                        2 -> notThisPerson()
+                    }
+                }
+                .show()
+        }
         gridListener = { ids ->
             g.photos.removeAll { it.id in ids }
             g.delete.removeAll(ids)
@@ -1732,6 +1814,363 @@ class MainActivity : Activity() {
         d.setContentView(root)
         d.show()
         refresh()
+    }
+
+    // ---------------------------------------------------------------- Carpetas
+
+    private fun canManageMedia(): Boolean =
+        Build.VERSION.SDK_INT >= 31 && MediaStore.canManageMedia(this)
+
+    private fun loadGallery() {
+        if (galleryLoading) return
+        galleryLoading = true
+        Thread {
+            val ps = try { scanner.queryAll() } catch (_: Throwable) { emptyList() }
+            ui {
+                allGallery = ps
+                galleryLoaded = true
+                galleryLoading = false
+                renderFolders()
+            }
+        }.start()
+    }
+
+    private fun renderFolders() {
+        if (!::foldersBox.isInitialized) return
+        val box = foldersBox
+        box.removeAllViews()
+
+        val hero = card().apply { setPadding(dp(20), dp(20), dp(20), dp(20)) }
+        hero.addView(tv(if (organizing) "Moviendo fotos…" else "Ordena tus fotos en carpetas", 26f, cText, bold = true))
+        val sub = tv(
+            if (organizing) "" else "Las carpetas se crean en la memoria del móvil (dentro de Imágenes), " +
+                "así que cualquier galería o explorador de archivos verá el mismo orden.",
+            14f, cSub
+        ).apply { setLineSpacing(0f, 1.2f) }
+        hero.addView(sub, lp(MATCH, WRAP).apply { topMargin = dp(6) })
+        val pb = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 1000
+            progressTintList = csl(cAccent)
+            progressBackgroundTintList = csl(cLine)
+            visibility = if (organizing) View.VISIBLE else View.GONE
+        }
+        hero.addView(pb, lp(MATCH, dp(10)).apply { topMargin = dp(16) })
+        folderProgress = pb
+        folderSub = sub
+        if (!organizing) {
+            hero.addView(pillButton("✨  Ordenar automáticamente", true, cAccent) {
+                ensurePerms { autoOrganize() }
+            }, lp(MATCH, WRAP).apply { topMargin = dp(18) })
+            hero.addView(pillButton("➕  Nueva carpeta", false, cAccent) {
+                ensurePerms { newFolderFlow() }
+            }, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+        }
+        box.addView(hero, lp(MATCH, WRAP).apply { topMargin = dp(6) })
+
+        if (Build.VERSION.SDK_INT >= 31 && !canManageMedia()) {
+            val tip = card()
+            tip.addView(tv("💡  Mover sin confirmar cada vez", 15f, cText, medium = true))
+            tip.addView(
+                tv("Android pide confirmación cada vez que se mueven fotos. Si activas «Gestión de contenido multimedia» para esta app, ya no lo hará.", 13f, cSub)
+                    .apply { setLineSpacing(0f, 1.15f) },
+                lp(MATCH, WRAP).apply { topMargin = dp(4) }
+            )
+            tip.addView(smallPill("Activar") {
+                try {
+                    startActivity(Intent(android.provider.Settings.ACTION_REQUEST_MANAGE_MEDIA, Uri.parse("package:$packageName")))
+                } catch (_: Exception) { toast("Búscalo en Ajustes → Apps → Acceso especial → Gestión de multimedia") }
+            }, lp(WRAP, WRAP).apply { topMargin = dp(10) })
+            box.addView(tip, lp(MATCH, WRAP).apply { topMargin = dp(12) })
+        }
+
+        if (!organizing && organizer.hasUndo()) {
+            val n = organizer.undoCount()
+            val u = card()
+            val r = row()
+            r.addView(tv("↩️", 22f, cText))
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(tv("Deshacer el último orden", 15f, cText, medium = true))
+            col.addView(tv("Devuelve $n ${if (n == 1) "foto" else "fotos"} a su carpeta anterior", 13f, cSub))
+            r.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(12) })
+            u.addView(r)
+            u.background = ripple(round(cCard, 20), 20)
+            u.setOnClickListener { undoLast() }
+            box.addView(u, lp(MATCH, WRAP).apply { topMargin = dp(12) })
+        }
+
+        box.addView(sectionTitle("Carpetas en el móvil"), lp(MATCH, WRAP).apply { topMargin = dp(22) })
+        if (!hasPerms()) {
+            box.addView(smallPill("Permitir acceso a las fotos") { ensurePerms { loadGallery() } },
+                lp(WRAP, WRAP).apply { topMargin = dp(8) })
+            return
+        }
+        if (!galleryLoaded) {
+            box.addView(tv("Cargando…", 13f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(8) })
+            loadGallery()
+            return
+        }
+        val fs = organizer.folders(allGallery)
+        box.addView(tv("${fs.size} carpetas · ${allGallery.size} fotos", 12f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(2) })
+        for (f in fs) {
+            val r = row().apply {
+                background = ripple(round(cCard, 16), 16)
+                setPadding(dp(10), dp(10), dp(12), dp(10))
+                if (!dark) elevation = dp(1).toFloat()
+                setOnClickListener {
+                    showGrid("📁  ${f.name}", f.photos.sortedByDescending { it.taken }, folderRel = f.relPath)
+                }
+            }
+            val iv = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = round(cLine, 12)
+                clipToOutline = true
+            }
+            r.addView(iv, LinearLayout.LayoutParams(dp(56), dp(56)))
+            loadThumb(f.photos.maxBy { it.taken }, iv)
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(tv(f.name, 15f, cText, medium = true).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
+            col.addView(tv("${f.photos.size} fotos · ${f.relPath.trimEnd('/')}", 12f, cSub).apply {
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.MIDDLE
+            })
+            r.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(12) })
+            r.addView(tv("›", 24f, cSub))
+            box.addView(r, lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        }
+    }
+
+    private fun askFolderName(title: String, cb: (String) -> Unit) {
+        val et = EditText(this).apply {
+            hint = "Nombre de la carpeta"
+            setSingleLine()
+        }
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(22), dp(8), dp(22), 0)
+            addView(et)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage("Se creará dentro de Imágenes.")
+            .setView(wrap)
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Aceptar") { _, _ ->
+                val name = Organizer.cleanName(et.text.toString())
+                if (name.isEmpty()) toast("Escribe un nombre") else cb(name)
+            }
+            .show()
+    }
+
+    /** Elige carpeta de destino: una existente o una nueva. Devuelve la ruta relativa. */
+    private fun chooseFolder(title: String, cb: (String) -> Unit) {
+        Thread {
+            val photos = if (galleryLoaded) allGallery else try { scanner.queryAll() } catch (_: Throwable) { emptyList() }
+            val fs = organizer.folders(photos)
+            ui {
+                val items = listOf("➕  Nueva carpeta…") + fs.map { "📁  ${it.name}  (${it.photos.size})" }
+                AlertDialog.Builder(this)
+                    .setTitle(title)
+                    .setItems(items.toTypedArray()) { _, w ->
+                        if (w == 0) askFolderName("Nueva carpeta") { cb("${Organizer.ROOT}$it/") }
+                        else cb(fs[w - 1].relPath)
+                    }
+                    .setNegativeButton("Cancelar", null)
+                    .show()
+            }
+        }.start()
+    }
+
+    private fun newFolderFlow() {
+        askFolderName("Nueva carpeta") { name ->
+            val target = "${Organizer.ROOT}$name/"
+            Thread {
+                val ps = if (galleryLoaded) allGallery else try { scanner.queryAll() } catch (_: Throwable) { emptyList() }
+                ui {
+                    toast("Selecciona las fotos que quieres guardar en «$name»")
+                    showGrid("Elige fotos para «$name»", ps.sortedByDescending { it.taken }, pickTarget = target)
+                }
+            }.start()
+        }
+    }
+
+    /** Mueve fotos en la memoria. Guarda dónde estaban para poder deshacer. */
+    private fun performMoves(moves: List<Pair<Photo, String>>, done: () -> Unit = {}) {
+        val todo = moves.filter { !it.first.relPath.equals(it.second, true) }
+        if (todo.isEmpty()) {
+            toast("Ya estaban en esa carpeta")
+            done()
+            return
+        }
+        organizer.saveLog(todo)
+        runMoveJobs(todo.map { (p, t) -> p.uri to { organizer.move(p, t) } }, "Movidas") {
+            galleryLoaded = false
+            renderFolders()
+            done()
+        }
+    }
+
+    private fun undoLast() {
+        val list = organizer.undoList()
+        if (list.isEmpty()) { organizer.clearLog(); renderFolders(); return }
+        AlertDialog.Builder(this)
+            .setTitle("Deshacer el último orden")
+            .setMessage("Se devolverán ${list.size} fotos a la carpeta donde estaban.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Deshacer") { _, _ ->
+                runMoveJobs(list.map { (uri, rel) -> uri to { organizer.moveBack(uri, rel) } }, "Devueltas") {
+                    organizer.clearLog()
+                    galleryLoaded = false
+                    renderFolders()
+                }
+            }
+            .show()
+    }
+
+    /**
+     * Ejecuta movimientos por tandas. En Android 11+ cada tanda necesita permiso de escritura
+     * (sin diálogo si la app tiene «Gestión de contenido multimedia»).
+     */
+    private fun runMoveJobs(jobs: List<Pair<Uri, () -> Boolean>>, verb: String, done: () -> Unit) {
+        if (jobs.isEmpty()) { done(); return }
+        val chunks = jobs.chunked(if (canManageMedia()) 5000 else 1500)
+        var ok = 0
+        var fail = 0
+        organizing = true
+        renderFolders()
+        fun finish() {
+            organizing = false
+            toast(if (fail == 0) "$verb $ok fotos ✓" else "$verb $ok fotos; $fail no se pudieron mover")
+            done()
+        }
+        fun runChunk(i: Int) {
+            if (i >= chunks.size) { finish(); return }
+            val chunk = chunks[i]
+            val work: () -> Unit = {
+                Thread {
+                    for ((j, job) in chunk.withIndex()) {
+                        val good = try { job.second() } catch (_: Throwable) { false }
+                        if (good) ok++ else fail++
+                        if (j % 15 == 0) {
+                            val doneN = ok + fail
+                            ui {
+                                folderSub?.text = "Moviendo $doneN de ${jobs.size} fotos…"
+                                folderProgress?.progress = doneN * 1000 / jobs.size
+                            }
+                        }
+                    }
+                    ui { runChunk(i + 1) }
+                }.start()
+            }
+            if (Build.VERSION.SDK_INT >= 30) {
+                try {
+                    val pi = MediaStore.createWriteRequest(contentResolver, chunk.map { it.first })
+                    pendingWrite = work
+                    pendingWriteCancel = { finish() }
+                    awaitingResult = true
+                    startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
+                } catch (e: Exception) {
+                    toast("No se pudo pedir permiso: ${e.message}")
+                    finish()
+                }
+            } else {
+                work()
+            }
+        }
+        runChunk(0)
+    }
+
+    private fun autoOrganize() {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(4), dp(22), dp(8))
+        }
+        val options = arrayOf(
+            "Por fecha · una carpeta por mes",
+            "Por fecha · una carpeta por año",
+            "Por persona · solo personas con nombre",
+            "Por categoría · comida, documentos, capturas…"
+        )
+        val rg = android.widget.RadioGroup(this)
+        options.forEachIndexed { i, o ->
+            rg.addView(android.widget.RadioButton(this).apply {
+                id = 500 + i
+                text = o
+                textSize = 15f
+                setTextColor(cText)
+                buttonTintList = csl(cAccent)
+            })
+        }
+        rg.check(500)
+        box.addView(rg)
+        fun check(t: String, v: Boolean): CheckBox {
+            val cb = CheckBox(this)
+            cb.text = t
+            cb.isChecked = v
+            cb.textSize = 14f
+            cb.setTextColor(cText)
+            cb.buttonTintList = csl(cAccent)
+            box.addView(cb, lp(MATCH, WRAP).apply { topMargin = dp(4) })
+            return cb
+        }
+        val noWa = check("No mover las fotos de WhatsApp", true)
+        val noCam = check("No mover las fotos de la cámara", false)
+        box.addView(
+            tv("Antes de mover nada te enseño cuántas fotos irán a cada carpeta. Siempre podrás deshacerlo.", 12f, cSub),
+            lp(MATCH, WRAP).apply { topMargin = dp(10) }
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("Ordenar automáticamente")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Ver qué se hará") { _, _ ->
+                val opt = rg.checkedRadioButtonId - 500
+                if (opt >= 2 && !analyzed) {
+                    toast("Primero analiza tus fotos en la pestaña Explorar")
+                    selectPage(1)
+                    return@setPositiveButton
+                }
+                if (opt == 2 && people.none { it.name.isNotBlank() }) {
+                    toast("Pon nombre a alguna persona en Explorar → Personas")
+                    selectPage(1)
+                    return@setPositiveButton
+                }
+                val skipWa = noWa.isChecked
+                val skipCam = noCam.isChecked
+                val pp = people
+                val ex = explorePhotos
+                Thread {
+                    val all = if (galleryLoaded) allGallery else try { scanner.queryAll() } catch (_: Throwable) { emptyList() }
+                    val plan = when (opt) {
+                        0 -> organizer.planByDate(all, true)
+                        1 -> organizer.planByDate(all, false)
+                        2 -> organizer.planByPerson(pp)
+                        else -> organizer.planByCategory(ex)
+                    }.filter { (p, t) ->
+                        !(skipWa && (p.folder.contains("WhatsApp", true) || p.relPath.contains("WhatsApp", true))) &&
+                            !(skipCam && p.isCamera) &&
+                            !p.relPath.equals(t, true)
+                    }
+                    ui { previewPlan(plan) }
+                }.start()
+            }
+            .show()
+    }
+
+    private fun previewPlan(plan: List<Pair<Photo, String>>) {
+        if (plan.isEmpty()) {
+            toast("No hay nada que mover: ya está todo en su sitio")
+            return
+        }
+        val byFolder = plan.groupBy { it.second }.map { (k, v) -> k to v.size }.sortedByDescending { it.second }
+        val lines = byFolder.take(14).joinToString("\n") { (k, n) ->
+            "•  ${k.removePrefix(Organizer.ROOT).trimEnd('/')}  —  $n"
+        } + if (byFolder.size > 14) "\n…y ${byFolder.size - 14} carpetas más" else ""
+        AlertDialog.Builder(this)
+            .setTitle("Mover ${plan.size} fotos a ${byFolder.size} carpetas")
+            .setMessage("$lines\n\nSe crearán dentro de Imágenes. Podrás deshacerlo desde esta pestaña.")
+            .setNegativeButton("Cancelar", null)
+            .setPositiveButton("Ordenar") { _, _ -> performMoves(plan) }
+            .show()
     }
 
     // ---------------------------------------------------------------- Metadatos
@@ -1864,6 +2303,7 @@ class MainActivity : Activity() {
                 ui {
                     if (r != null && ok == 0) {
                         pendingWrite = { performEdit(ps, msg, change, after) }
+                        pendingWriteCancel = null
                         try {
                             awaitingResult = true; startIntentSenderForResult(r.userAction.actionIntent.intentSender, REQ_WRITE, null, 0, 0, 0)
                         } catch (_: Exception) {
@@ -1880,6 +2320,7 @@ class MainActivity : Activity() {
             try {
                 val pi = MediaStore.createWriteRequest(contentResolver, ps.map { it.uri })
                 pendingWrite = job
+                pendingWriteCancel = null
                 awaitingResult = true; startIntentSenderForResult(pi.intentSender, REQ_WRITE, null, 0, 0, 0)
             } catch (e: Exception) {
                 toast("No se pudo pedir permiso: ${e.message}")
@@ -1934,8 +2375,13 @@ class MainActivity : Activity() {
         if (requestCode == REQ_TRASH && resultCode == RESULT_OK) removeDone(pendingTrash, "Movidas a la papelera")
         if (requestCode == REQ_WRITE) {
             val job = pendingWrite
+            val cancelJob = pendingWriteCancel
             pendingWrite = null
-            if (resultCode == RESULT_OK) job?.invoke() else toast("Cambio cancelado")
+            pendingWriteCancel = null
+            if (resultCode == RESULT_OK) job?.invoke() else {
+                toast("Cambio cancelado")
+                cancelJob?.invoke()
+            }
         }
     }
 

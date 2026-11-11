@@ -31,6 +31,15 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - En Ajustes: cambiar el código, desactivar la calculadora y disfrazar icono y nombre como «Calculadora».
 - Si sales de la app más de 30 segundos, vuelve a pedir el código; la vista previa en recientes se oculta (Android 13+).
 
+## Carpetas (v1.5)
+- Pestaña **Carpetas**: todas las carpetas de fotos del móvil; abre cualquiera para ver, mover o borrar.
+- **Mover** desde cualquier rejilla (categoría, persona, carpeta) a una carpeta existente o nueva.
+- **Nueva carpeta**: se le pone nombre y se eligen las fotos.
+- **Ordenar automáticamente** por mes, por año, por persona (con nombre) o por categoría, con vista previa.
+- Los movimientos se hacen en la memoria del móvil (dentro de Imágenes), así que cualquier galería ve el mismo orden.
+- **Deshacer** el último orden.
+- Opcional en Android 12+: «Gestión de contenido multimedia» para no confirmar cada tanda.
+
 ## Borrado
 - Android 11+: van a la **papelera del sistema** (recuperables 30 días) y Android pide confirmación.
 - Android 8–10: borrado definitivo, con aviso previo.

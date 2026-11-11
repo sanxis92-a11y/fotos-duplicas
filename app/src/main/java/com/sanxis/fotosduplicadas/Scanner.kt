@@ -29,7 +29,10 @@ class Scanner(private val cr: ContentResolver, private val dir: File) {
 
     // ------------------------------------------------------------ Galería
 
-    fun query(s: Settings): List<Photo> {
+    /** Todas las fotos de la memoria, sin filtros (para la pestaña Carpetas). */
+    fun queryAll(): List<Photo> = query(null)
+
+    fun query(s: Settings?): List<Photo> {
         val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         @Suppress("DEPRECATION")
         val pathCol = if (Build.VERSION.SDK_INT >= 29) MediaStore.Images.Media.RELATIVE_PATH else MediaStore.Images.Media.DATA
@@ -39,11 +42,11 @@ class Scanner(private val cr: ContentResolver, private val dir: File) {
             MediaStore.Images.Media.SIZE, MediaStore.Images.Media.DATE_TAKEN,
             MediaStore.Images.Media.DATE_MODIFIED, MediaStore.Images.Media.BUCKET_DISPLAY_NAME, pathCol
         )
-        val excluded = s.excluded
-        val chosen = s.folders
-        val scope = s.scope
+        val excluded = s?.excluded ?: emptySet()
+        val chosen = s?.folders ?: emptySet()
+        val scope = s?.scope ?: 0
         val out = ArrayList<Photo>()
-        val minBytes = s.minKb * 1024L
+        val minBytes = (s?.minKb ?: 0) * 1024L
         cr.query(
             base, proj, "${MediaStore.Images.Media.SIZE} >= ?", arrayOf(minBytes.toString()),
             "${MediaStore.Images.Media.DATE_ADDED} DESC"
@@ -62,7 +65,7 @@ class Scanner(private val cr: ContentResolver, private val dir: File) {
                 out += Photo(
                     id, ContentUris.withAppendedId(base, id), c.getString(1) ?: "", folder, camera,
                     c.getInt(2), c.getInt(3), c.getLong(4), taken, modified
-                )
+                ).apply { relPath = if (Build.VERSION.SDK_INT >= 29) path else Organizer.relFromData(path) }
             }
         }
         return out

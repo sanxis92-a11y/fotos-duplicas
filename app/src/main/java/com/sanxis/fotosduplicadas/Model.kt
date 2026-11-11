@@ -8,7 +8,7 @@ import kotlin.math.min
 
 /** Una foto de la galería con su huella visual y sus métricas de calidad. */
 class Photo(
-    val id: Long, val uri: Uri, val name: String, val folder: String, val isCamera: Boolean,
+    val id: Long, val uri: Uri, var name: String, var folder: String, val isCamera: Boolean,
     var w: Int, var h: Int, val size: Long, val taken: Long, val modified: Long
 ) {
     /** dHash horizontal+vertical: [0,1] original, [2,3] 90°, [4,5] 180°, [6,7] 270°, [8,9] espejo. */
@@ -23,6 +23,8 @@ class Photo(
     var labels: List<String> = emptyList()
     var faces: List<FaceInfo> = emptyList()
     var hasGps = false
+    /** Carpeta relativa a la memoria, p. ej. "DCIM/Camera/" o "Pictures/Viajes/". */
+    var relPath = ""
     var gpsChecked = false   // false si no se pudo comprobar (sin permiso de ubicación de fotos)
     var contentDone = false
 
