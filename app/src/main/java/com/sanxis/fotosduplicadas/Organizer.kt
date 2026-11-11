@@ -84,16 +84,6 @@ class Organizer(private val ctx: Context) {
         return best.values.map { (p, v) -> p to "${ROOT}Personas/${v.second}/" }
     }
 
-    fun planByCategory(photos: List<Photo>): List<Pair<Photo, String>> {
-        // Orden de prioridad: lo más concreto primero; las categorías genéricas de personas no cuentan
-        val skip = setOf("people", "groups", "nopeople", "whatsapp")
-        val cats = ContentAnalyzer.CATEGORIES.filter { it.key !in skip }
-        return photos.mapNotNull { p ->
-            val c = cats.firstOrNull { it.test(p) } ?: return@mapNotNull null
-            p to "${ROOT}Categorías/${cleanName(c.title)}/"
-        }
-    }
-
     // ------------------------------------------------------------ Mover
 
     /** Mueve una foto. Devuelve true si se movió (o ya estaba allí). */

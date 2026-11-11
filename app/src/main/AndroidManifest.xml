@@ -20,6 +20,7 @@
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true"
         android:allowBackup="false"
+        android:largeHeap="true"
         android:theme="@style/AppTheme">
         <!-- Pantalla de entrada: calculadora. El código secreto abre la app. -->
         <activity

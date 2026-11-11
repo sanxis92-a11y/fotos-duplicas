@@ -26,6 +26,10 @@ jobs:
           mkdir -p app/src/main/assets
           curl -fsSL -o /tmp/buffalo_s.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_s.zip
           unzip -o -j /tmp/buffalo_s.zip det_500m.onnx w600k_mbf.onnx -d app/src/main/assets
+          # Segunda opinión: modelo grande w600k_r50 (de buffalo_l)
+          curl -fsSL -o /tmp/buffalo_l.zip https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+          unzip -o -j /tmp/buffalo_l.zip "*w600k_r50.onnx" -d app/src/main/assets
+          rm -f /tmp/buffalo_l.zip /tmp/buffalo_s.zip
           ls -la app/src/main/assets
           echo "::notice::Modelos de caras: $(du -ch app/src/main/assets/*.onnx | tail -1)"
       - name: Compilar

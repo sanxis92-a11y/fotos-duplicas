@@ -31,6 +31,14 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - En Ajustes: cambiar el código, desactivar la calculadora y disfrazar icono y nombre como «Calculadora».
 - Si sales de la app más de 30 segundos, vuelve a pedir el código; la vista previa en recientes se oculta (Android 13+).
 
+## Personas (v2.0)
+- Sin categorías: Explorar se centra en las personas.
+- **Caras sin identificar**: todas las caras que no han entrado en ninguna persona; toca para decir quién es (o ignorar).
+- **Preguntas Sí / No**: la app propone caras parecidas a cada persona y grupos que podrían ser la misma persona; cada respuesta se guarda y mejora el agrupado.
+- **Segunda opinión**: el modelo grande InsightFace w600k_r50 revisa solo las caras difíciles (en pruebas con fotos muy degradadas: 79 % frente a 63 %). Es ~16 veces más lento, por eso no se usa en todas.
+- **Diagnóstico**: cuántas caras se detectan, cuántas se descartan y por qué, y cuántas quedan sueltas.
+- Lo que confirmas se guarda por foto y posición de la cara, así que sobrevive a nuevos análisis. Pruebas en `app/src/test`.
+
 ## Nombres en los metadatos (v1.8)
 - Lee las caras etiquetadas por otros programas (XMP de Lightroom, Picasa, digiKam, Windows Fotos; IPTC PersonInImage) y las muestra en ⓘ Datos.
 - Usa esos nombres para nombrar automáticamente a las personas en Explorar (si no les has puesto otro).

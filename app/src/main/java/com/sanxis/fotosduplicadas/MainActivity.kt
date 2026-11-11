@@ -60,6 +60,7 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
 
@@ -126,6 +127,11 @@ class MainActivity : Activity() {
     private lateinit var analyzer: ContentAnalyzer
     private var explorePhotos: List<Photo> = emptyList()
     private var people: List<Person> = emptyList()
+    private var peopleState = PeopleState()
+    private var peopleResult: PeopleResult? = null
+    private var photoById: Map<Long, Photo> = emptyMap()
+    private var faceStats: ContentAnalyzer.FaceStats? = null
+    private var exTitle = "Analizando…"
     private var analyzed = false
     @Volatile private var exploring = false
     private var page = 0
@@ -362,6 +368,7 @@ class MainActivity : Activity() {
         organizer = Organizer(this)
         root.addView(pages, LinearLayout.LayoutParams(MATCH, 0, 1f))
         analyzer = ContentAnalyzer(this, scanner)
+        peopleState = loadPeopleState()
         selectPage(0)
 
         setContentView(root)
@@ -1214,16 +1221,16 @@ class MainActivity : Activity() {
         val title: String
         val sub: String
         when {
-            exploring -> { title = "Analizando…"; sub = "" }
+            exploring -> { title = exTitle; sub = "" }
             !analyzed -> {
-                title = "Reconoce personas y cosas"
-                sub = "Detecto caras, agrupo por persona y clasifico tus fotos (comida, documentos, capturas, " +
-                    "animales…). Todo dentro del móvil. La primera vez tarda unos minutos; después solo analiza las nuevas."
+                title = "Reconoce a las personas"
+                sub = "Detecto las caras de tus fotos y las agrupo por persona. Todo dentro del móvil. " +
+                    "La primera vez tarda unos minutos; después solo analiza las fotos nuevas."
             }
             else -> {
-                val gps = explorePhotos.count { it.hasGps }
-                title = "${explorePhotos.size} fotos analizadas"
-                sub = "${people.size} ${if (people.size == 1) "persona" else "personas"} · $gps con ubicación GPS"
+                val named = people.count { it.named }
+                title = "${people.size} ${if (people.size == 1) "persona" else "personas"}"
+                sub = "$named con nombre · ${explorePhotos.size} fotos analizadas"
             }
         }
         hero.addView(tv(title, 26f, cText, bold = true))
@@ -1241,7 +1248,7 @@ class MainActivity : Activity() {
         val label = when {
             exploring -> "Cancelar"
             analyzed -> "Analizar fotos nuevas"
-            else -> "Analizar contenido"
+            else -> "Analizar mis fotos"
         }
         hero.addView(pillButton(label, !exploring, if (exploring) cRed else cAccent) {
             if (exploring) analyzer.cancel = true else ensurePerms { startAnalysis() }
@@ -1249,35 +1256,72 @@ class MainActivity : Activity() {
         box.addView(hero, lp(MATCH, WRAP).apply { topMargin = dp(6) })
 
         if (!analyzed || exploring) return
+        val res = peopleResult
 
-        // Personas
-        box.addView(sectionTitle("Personas"), lp(MATCH, WRAP).apply { topMargin = dp(22) })
-        when {
-            !analyzer.hasFaceModel -> box.addView(
-                tv("Agrupar por persona no está disponible en esta versión (falta el modelo de caras). Lo demás funciona.", 13f, cSub),
-                lp(MATCH, WRAP).apply { topMargin = dp(6) }
+        if (!analyzer.hasFaceModel) {
+            box.addView(
+                tv("Reconocer personas no está disponible en esta versión (faltan los modelos de caras).", 13f, cSub),
+                lp(MATCH, WRAP).apply { topMargin = dp(16) }
             )
-            people.isEmpty() -> {
+        } else {
+            // Sugerencias
+            val pending = (res?.merges?.size ?: 0) + (res?.suggestions?.size ?: 0)
+            if (pending > 0) {
+                box.addView(actionCard(
+                    "💡", "Ayúdame a reconocer a más gente",
+                    "$pending ${if (pending == 1) "pregunta rápida" else "preguntas rápidas"} de Sí / No. Cada respuesta mejora el reconocimiento.",
+                    cAccent
+                ) { startReview() }, lp(MATCH, WRAP).apply { topMargin = dp(16) })
+            }
+
+            // Personas
+            box.addView(sectionTitle("Personas"), lp(MATCH, WRAP).apply { topMargin = dp(22) })
+            if (people.isEmpty()) {
                 box.addView(
-                    tv("Todavía no hay suficientes caras repetidas para formar personas. Prueba a mover el control hacia «Juntar más».", 13f, cSub),
+                    tv("Todavía no hay personas. Abre «Caras sin identificar» y dime quién es quién: con unas pocas caras la app reconoce el resto.", 13f, cSub),
                     lp(MATCH, WRAP).apply { topMargin = dp(6) }
                 )
-                box.addView(peopleTuner(), lp(MATCH, WRAP).apply { topMargin = dp(10) })
-            }
-            else -> {
+            } else {
                 box.addView(
-                    tv("Toca para ver sus fotos · mantén pulsado para ponerle nombre. Dos personas con el mismo nombre se unen.", 12f, cSub),
+                    tv("Toca para ver sus fotos · mantén pulsado para ponerle nombre o unirla con otra.", 12f, cSub),
                     lp(MATCH, WRAP).apply { topMargin = dp(4) }
                 )
-                box.addView(peopleTuner(), lp(MATCH, WRAP).apply { topMargin = dp(10) })
                 val strip = row().apply { gravity = Gravity.TOP }
-                people.take(80).forEachIndexed { i, pr -> strip.addView(personView(pr, i)) }
+                var unnamed = 0
+                people.take(120).forEach { pr -> strip.addView(personView(pr, if (pr.name.isBlank()) ++unnamed else 0)) }
                 box.addView(HorizontalScrollView(this).apply {
                     isHorizontalScrollBarEnabled = false
                     overScrollMode = View.OVER_SCROLL_NEVER
                     addView(strip)
                 }, lp(MATCH, WRAP).apply { topMargin = dp(12) })
             }
+
+            // Caras sin identificar
+            val loose = res?.loose?.size ?: 0
+            box.addView(actionCard(
+                "❓", "Caras sin identificar",
+                if (loose == 0) "Ninguna: todas las caras están en alguna persona"
+                else "$loose ${if (loose == 1) "cara" else "caras"} que no he sabido agrupar. Dime quién es.",
+                cText
+            ) { if (loose > 0) showLooseFaces() }, lp(MATCH, WRAP).apply { topMargin = dp(14) })
+
+            // Segunda opinión
+            if (analyzer.hasLargeModel) {
+                val targets = secondOpinionTargets()
+                val n = targets.size
+                val mins = max(1, (n * 0.6 / 60).roundToInt())
+                box.addView(actionCard(
+                    "🔬", "Segunda opinión",
+                    if (n == 0) "Hecha. Las caras difíciles ya las ha revisado el modelo de alta precisión."
+                    else "Revisa las $n caras difíciles con un modelo más preciso (más lento: unos $mins min). " +
+                        "Puedes cancelarlo y seguir otro día.",
+                    cTeal
+                ) { if (n > 0) startSecondOpinion() }, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+            }
+
+            // Diagnóstico y ajuste
+            box.addView(sectionTitle("Diagnóstico"), lp(MATCH, WRAP).apply { topMargin = dp(22) })
+            box.addView(diagnosticsCard(), lp(MATCH, WRAP).apply { topMargin = dp(10) })
         }
 
         // Privacidad
@@ -1307,49 +1351,94 @@ class MainActivity : Activity() {
             }, lp(WRAP, WRAP).apply { topMargin = dp(8) })
         }
         box.addView(priv, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+    }
 
-        // Categorías
-        box.addView(sectionTitle("Categorías"), lp(MATCH, WRAP).apply { topMargin = dp(22) })
-        val cats = ContentAnalyzer.CATEGORIES.map { c -> c to explorePhotos.filter(c.test) }.filter { it.second.isNotEmpty() }
-        if (cats.isEmpty()) {
-            box.addView(tv("Sin categorías todavía.", 13f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(6) })
-        }
-        cats.chunked(2).forEach { pair ->
-            val r = row().apply { gravity = Gravity.TOP }
-            pair.forEachIndexed { i, (c, ps) ->
-                r.addView(categoryTile(c, ps), LinearLayout.LayoutParams(0, WRAP, 1f).apply { if (i == 1) leftMargin = dp(10) })
+    private fun actionCard(icon: String, title: String, sub: String, color: Int, onClick: () -> Unit): View {
+        val c = card()
+        val r = row()
+        r.addView(tv(icon, 24f, cText))
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(tv(title, 15f, if (color == cText) cText else color, medium = true))
+        col.addView(tv(sub, 13f, cSub).apply { setLineSpacing(0f, 1.15f) })
+        r.addView(col, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(12) })
+        r.addView(tv("›", 26f, cSub))
+        c.addView(r)
+        c.background = ripple(round(cCard, 20), 20)
+        c.setOnClickListener { onClick() }
+        return c
+    }
+
+    private fun diagnosticsCard(): View {
+        val c = card()
+        val st = faceStats
+        if (st != null) {
+            fun line(k: String, v: String) {
+                val r = row()
+                r.addView(tv(k, 13f, cSub), LinearLayout.LayoutParams(0, WRAP, 1f))
+                r.addView(tv(v, 13f, cText, medium = true))
+                c.addView(r, lp(MATCH, WRAP).apply { topMargin = dp(4) })
             }
-            if (pair.size == 1) r.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f).apply { leftMargin = dp(10) })
-            box.addView(r, lp(MATCH, WRAP).apply { topMargin = dp(10) })
+            line("Fotos con caras", "${st.withFaces} de ${st.photos}")
+            line("Caras detectadas", "${st.faces}")
+            line("Útiles para reconocer", "${st.usable}")
+            if (st.profile > 0) line("Descartadas: de perfil", "${st.profile}")
+            if (st.small > 0) line("Descartadas: muy pequeñas", "${st.small}")
+            if (st.failed > 0) line("Descartadas: otras", "${st.failed}")
+            val res = peopleResult
+            if (res != null) {
+                line("En alguna persona", "${res.groups.sumOf { it.faces.size }}")
+                line("Sin identificar", "${res.loose.size}")
+            }
+            if (st.second > 0) line("Revisadas con segunda opinión", "${st.second}")
         }
-    }
 
-    private fun categoryTile(c: Category, ps: List<Photo>): View {
-        val t = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = ripple(round(cCard, 18), 18)
-            if (!dark) elevation = dp(1).toFloat()
-            setPadding(dp(8), dp(8), dp(8), dp(12))
-            setOnClickListener { showGrid("${c.emoji}  ${c.title}", ps) }
+        // Ajuste fino
+        val r = row()
+        r.addView(tv("Agrupar caras", 15f, cText, medium = true), LinearLayout.LayoutParams(0, WRAP, 1f))
+        val value = tv("", 13f, cAccent, medium = true)
+        r.addView(value)
+        c.addView(r, lp(MATCH, WRAP).apply { topMargin = dp(16) })
+        fun label(v: Int) = when {
+            v <= 8 -> "Muy estricto"
+            v <= 13 -> "Estricto"
+            v <= 17 -> "Automático"
+            v <= 23 -> "Flexible"
+            else -> "Muy flexible"
         }
-        val iv = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            background = round(cLine, 12)
-            clipToOutline = true
+        val bar = SeekBar(this).apply {
+            max = 30
+            progress = settings.peopleSens.coerceIn(0, 30)
+            progressTintList = csl(cAccent)
+            thumbTintList = csl(cAccent)
+            progressBackgroundTintList = csl(cLine)
         }
-        t.addView(iv, lp(MATCH, dp(100)))
-        loadThumb(ps[0], iv)
-        t.addView(tv("${c.emoji}  ${c.title}", 14f, cText, medium = true).apply {
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-        }, lp(MATCH, WRAP).apply { topMargin = dp(8); leftMargin = dp(4) })
-        t.addView(tv("${ps.size} ${if (ps.size == 1) "foto" else "fotos"}", 12f, cSub), lp(MATCH, WRAP).apply {
-            leftMargin = dp(4); topMargin = dp(2)
+        value.text = label(bar.progress)
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, v: Int, fromUser: Boolean) { value.text = label(v) }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {
+                settings.peopleSens = bar.progress
+                toast("Reagrupando caras…")
+                regroupPeople()
+            }
         })
-        return t
+        c.addView(bar, lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        val hints = row()
+        hints.addView(tv("Separar más", 12f, cSub), LinearLayout.LayoutParams(0, WRAP, 1f))
+        hints.addView(tv("Juntar más", 12f, cSub))
+        c.addView(hints)
+        c.addView(tv("Detalle técnico: ${analyzer.lastStats}", 11f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(8) })
+        if (peopleState.rejected.isNotEmpty() || peopleState.ignored.isNotEmpty() || peopleState.notSame.isNotEmpty()) {
+            c.addView(smallPill("Deshacer correcciones «No es» / ignoradas") {
+                peopleState.clearCorrections()
+                savePeopleState()
+                regroupPeople()
+            }, lp(WRAP, WRAP).apply { topMargin = dp(10) })
+        }
+        return c
     }
 
-    private fun personView(pr: Person, i: Int): View {
+    private fun personView(pr: Person, unnamedIndex: Int): View {
         val size = dp(76)
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1366,13 +1455,13 @@ class MainActivity : Activity() {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 setColor(Color.TRANSPARENT)
-                setStroke(dp(2), if (pr.name.isBlank()) cLine else cAccent)
+                setStroke(dp(2), if (pr.named) cAccent else cLine)
             }
             foreground = ripple(null, 42)
             addView(iv, FrameLayout.LayoutParams(size, size))
         }
         col.addView(ring)
-        val name = pr.name.ifBlank { "Persona ${i + 1}" }
+        val name = displayName(pr, unnamedIndex)
         col.addView(tv(name, 13f, if (pr.name.isBlank()) cSub else cText, medium = true).apply {
             maxWidth = size + dp(12)
             maxLines = 1
@@ -1380,14 +1469,18 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }, lp(WRAP, WRAP).apply { topMargin = dp(6) })
         col.addView(tv("${pr.photos.size} fotos", 11f, cSub))
-        loadFace(pr, iv)
+        val (cp, cf) = pr.cover
+        loadFaceCrop(cp, cf, iv)
         ring.setOnClickListener { showGrid("👤  $name", pr.photos, pr) }
-        ring.setOnLongClickListener { renamePerson(pr); true }
+        ring.setOnLongClickListener { personMenu(pr, name); true }
         return col
     }
 
-    private fun loadFace(pr: Person, iv: ImageView) {
-        val (p, f) = pr.cover
+    private fun displayName(pr: Person, unnamedIndex: Int = 0) =
+        pr.name.ifBlank { if (unnamedIndex > 0) "Persona $unnamedIndex" else "Sin nombre" }
+
+    /** Recorte cuadrado de una cara. */
+    private fun loadFaceCrop(p: Photo, f: FaceInfo, iv: ImageView) {
         val key = "${p.id}:${f.l}:${f.t}"
         iv.tag = key
         val cached = faceCache.get(key)
@@ -1422,12 +1515,74 @@ class MainActivity : Activity() {
         } catch (_: Exception) { }
     }
 
-    private fun names(): Map<String, String> =
-        getSharedPreferences("personas", MODE_PRIVATE).all.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
+    // ---------------------------------------------------------------- Personas: datos
 
-    private fun renamePerson(pr: Person) {
+    private fun peopleFile() = java.io.File(filesDir, "personas_v2.txt")
+
+    private fun loadPeopleState(): PeopleState = try {
+        if (peopleFile().exists()) PeopleState.parse(peopleFile().readText()) else PeopleState()
+    } catch (_: Exception) { PeopleState() }
+
+    private fun savePeopleState() {
+        try {
+            val tmp = java.io.File(filesDir, "personas_v2.tmp")
+            tmp.writeText(peopleState.serialize())
+            tmp.renameTo(peopleFile())
+        } catch (_: Exception) { }
+    }
+
+    private fun faceOf(r: FaceRef): Pair<Photo, FaceInfo>? {
+        val p = photoById[r.photoId] ?: return null
+        val f = p.faces.getOrNull(r.index) ?: return null
+        return p to f
+    }
+
+    private fun applyResult(res: PeopleResult) {
+        peopleResult = res
+        people = res.groups.mapNotNull { g ->
+            val faces = g.faces.mapNotNull { faceOf(it) }
+            if (faces.isEmpty()) null else Person(g.id, g.name, g.named, faces, g.faces)
+        }
+    }
+
+    private fun regroupPeople(after: () -> Unit = {}) {
+        val ps = explorePhotos
+        val st = peopleState
+        val sens = settings.peopleSens
+        Thread {
+            val res = try {
+                analyzer.cancel = false
+                analyzer.people(analyzer.faceRefs(ps), st, sens)
+            } catch (_: Throwable) { null }
+            val stats = try { analyzer.stats(ps) } catch (_: Throwable) { null }
+            ui {
+                if (res != null) applyResult(res)
+                if (stats != null) faceStats = stats
+                renderExplore()
+                after()
+            }
+        }.start()
+    }
+
+    // ---------------------------------------------------------------- Personas: acciones
+
+    private fun personMenu(pr: Person, name: String) {
+        val items = arrayOf(if (pr.named) "✏️  Cambiar nombre" else "✏️  Poner nombre", "🔗  Unir con otra persona…", "🖼️  Ver sus fotos")
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setItems(items) { _, w ->
+                when (w) {
+                    0 -> renamePerson(pr)
+                    1 -> mergePersonFlow(pr)
+                    2 -> showGrid("👤  $name", pr.photos, pr)
+                }
+            }
+            .show()
+    }
+
+    private fun askName(title: String, initial: String, cb: (String) -> Unit) {
         val et = EditText(this).apply {
-            setText(pr.name)
+            setText(initial)
             hint = "Nombre"
             setSingleLine()
         }
@@ -1436,99 +1591,420 @@ class MainActivity : Activity() {
             addView(et)
         }
         AlertDialog.Builder(this)
-            .setTitle("¿Quién es?")
-            .setMessage("Si pones el mismo nombre a dos personas, se unen en una.")
+            .setTitle(title)
             .setView(wrap)
             .setNegativeButton("Cancelar", null)
-            .setPositiveButton("Guardar") { _, _ ->
-                val name = et.text.toString().trim()
-                val ed = getSharedPreferences("personas", MODE_PRIVATE).edit()
-                for (k in pr.keys) if (name.isEmpty()) ed.remove(k) else ed.putString(k, name)
-                ed.apply()
-                pr.name = name
+            .setPositiveButton("Guardar") { _, _ -> cb(et.text.toString().trim()) }
+            .show()
+    }
+
+    /** Pone nombre. En un grupo automático, todas sus caras pasan a ser de esa persona (confirmadas). */
+    private fun renamePerson(pr: Person) {
+        askName("¿Quién es?", pr.name) { name ->
+            if (pr.named) {
+                peopleState.rename(pr.id, name)
+            } else {
+                val rec = peopleState.createPerson(name)
+                pr.refs.forEach { peopleState.confirm(it, rec.id) }
+            }
+            savePeopleState()
+            regroupPeople()
+        }
+    }
+
+    /** Asegura que el grupo es una persona guardada (si era automático, la crea). Devuelve su id. */
+    private fun ensureRecord(pr: Person): String {
+        if (pr.named) return pr.id
+        val rec = peopleState.createPerson(pr.name)
+        pr.refs.forEach { peopleState.confirm(it, rec.id) }
+        return rec.id
+    }
+
+    private fun mergePersonFlow(pr: Person) {
+        val others = people.filter { it.id != pr.id }
+        if (others.isEmpty()) { toast("No hay otras personas"); return }
+        var unnamed = 0
+        val labels = others.map { o -> "${displayName(o, if (o.name.isBlank()) ++unnamed else 0)}  (${o.photos.size} fotos)" }
+        AlertDialog.Builder(this)
+            .setTitle("¿Con quién la unes?")
+            .setItems(labels.toTypedArray()) { _, w ->
+                val other = others[w]
+                val a = ensureRecord(other)
+                if (pr.named) peopleState.merge(a, pr.id) else pr.refs.forEach { peopleState.confirm(it, a) }
+                if (peopleState.persons[a]?.name.isNullOrBlank() && pr.name.isNotBlank()) peopleState.rename(a, pr.name)
+                savePeopleState()
                 regroupPeople()
+                toast("Unidas")
             }
             .show()
     }
 
-    /** Control para ajustar cuánto se parecen dos caras para ser la misma persona. */
-    private fun peopleTuner(): View {
-        val c = card()
-        val r = row()
-        r.addView(tv("Agrupar caras", 15f, cText, medium = true), LinearLayout.LayoutParams(0, WRAP, 1f))
-        val value = tv("", 13f, cAccent, medium = true)
-        r.addView(value)
-        c.addView(r)
-        fun label(v: Int) = when {
-            v <= 8 -> "Muy estricto"
-            v <= 13 -> "Estricto"
-            v <= 17 -> "Automático"
-            v <= 23 -> "Flexible"
-            else -> "Muy flexible"
+    /** ¿Quién es? para una o varias caras: persona existente, nueva o ignorar. */
+    private fun assignFaces(refs: List<FaceRef>, done: () -> Unit) {
+        if (refs.isEmpty()) return
+        val named = people.filter { it.named && it.name.isNotBlank() }
+        val items = mutableListOf("➕  Persona nueva…")
+        items += named.map { "👤  ${it.name}" }
+        items += "🚫  No me interesa (ignorar)"
+        AlertDialog.Builder(this)
+            .setTitle(if (refs.size == 1) "¿Quién es?" else "¿Quién es? (${refs.size} caras)")
+            .setItems(items.toTypedArray()) { _, w ->
+                when {
+                    w == 0 -> askName("Persona nueva", "") { name ->
+                        val rec = peopleState.createPerson(name)
+                        refs.forEach { peopleState.confirm(it, rec.id) }
+                        savePeopleState()
+                        regroupPeople(done)
+                    }
+                    w <= named.size -> {
+                        val pid = named[w - 1].id
+                        refs.forEach { peopleState.confirm(it, pid) }
+                        savePeopleState()
+                        regroupPeople(done)
+                    }
+                    else -> {
+                        refs.forEach { peopleState.ignore(it) }
+                        savePeopleState()
+                        regroupPeople(done)
+                    }
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    // ---------------------------------------------------------------- Caras sin identificar
+
+    private fun showLooseFaces() {
+        val res = peopleResult ?: return
+        val faces = res.loose.take(600).mapNotNull { r -> faceOf(r)?.let { r to it } }.toMutableList()
+        val d = Dialog(
+            this,
+            if (dark) android.R.style.Theme_Material_NoActionBar_Fullscreen
+            else android.R.style.Theme_Material_Light_NoActionBar_Fullscreen
+        )
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(cBg)
         }
-        val bar = SeekBar(this).apply {
-            max = 30
-            progress = settings.peopleSens.coerceIn(0, 30)
-            progressTintList = csl(cAccent)
-            thumbTintList = csl(cAccent)
-            progressBackgroundTintList = csl(cLine)
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val b = insets.getInsets(WindowInsets.Type.systemBars())
+                v.setPadding(0, b.top, 0, b.bottom)
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(0, insets.systemWindowInsetTop, 0, insets.systemWindowInsetBottom)
+            }
+            insets
         }
-        value.text = label(bar.progress)
-        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, v: Int, fromUser: Boolean) { value.text = label(v) }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {
-                settings.peopleSens = bar.progress
-                toast("Reagrupando caras…")
+        val head = row().apply { setPadding(dp(12), dp(10), dp(12), dp(10)) }
+        head.addView(tv("✕", 18f, cText).apply {
+            gravity = Gravity.CENTER
+            background = ripple(round(cCard, 22), 22)
+            setOnClickListener { d.dismiss() }
+        }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        val tcol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        tcol.addView(tv("Caras sin identificar", 18f, cText, bold = true))
+        val countTv = tv("", 12f, cSub)
+        tcol.addView(countTv)
+        head.addView(tcol, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(12) })
+        root.addView(head, MATCH, WRAP)
+
+        val cols = 4
+        val gap = dp(4)
+        val cell = (resources.displayMetrics.widthPixels - gap * (cols + 1)) / cols
+        val grid = GridView(this).apply {
+            numColumns = cols
+            horizontalSpacing = gap
+            verticalSpacing = gap
+            stretchMode = GridView.STRETCH_COLUMN_WIDTH
+            setPadding(gap, 0, gap, gap)
+            clipToPadding = false
+            selector = ColorDrawable(Color.TRANSPARENT)
+        }
+        root.addView(grid, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(10), dp(12), dp(12))
+            setBackgroundColor(cBg)
+            visibility = View.GONE
+        }
+        val who = pillButton("👤 ¿Quién es?", true, cAccent) {}
+        val ign = pillButton("🚫 Ignorar", false, cAccent) {}
+        bar.addView(who, LinearLayout.LayoutParams(0, WRAP, 1f))
+        bar.addView(ign, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(8) })
+        root.addView(bar, MATCH, WRAP)
+
+        val sel = LinkedHashSet<Int>()
+        lateinit var adapter: BaseAdapter
+        fun refresh() {
+            countTv.text = if (sel.isNotEmpty()) "${sel.size} seleccionadas" else "${faces.size} caras · toca para decir quién es · mantén para elegir varias"
+            bar.visibility = if (sel.isNotEmpty()) View.VISIBLE else View.GONE
+            adapter.notifyDataSetChanged()
+        }
+        adapter = object : BaseAdapter() {
+            override fun getCount() = faces.size
+            override fun getItem(position: Int): Any = faces[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
+                val fr = (convertView as? FrameLayout) ?: FrameLayout(this@MainActivity).apply {
+                    layoutParams = AbsListView.LayoutParams(cell, cell)
+                    addView(ImageView(this@MainActivity).apply {
+                        scaleType = ImageView.ScaleType.CENTER_CROP
+                        background = round(cLine, 14)
+                        clipToOutline = true
+                    }, FrameLayout.LayoutParams(MATCH, MATCH))
+                    addView(tv("✓", 12f, Color.WHITE, bold = true).apply {
+                        gravity = Gravity.CENTER
+                        background = round(cAccent, 11)
+                    }, FrameLayout.LayoutParams(dp(22), dp(22), Gravity.TOP or Gravity.END).apply { setMargins(0, dp(5), dp(5), 0) })
+                }
+                val (_, pf) = faces[position]
+                val iv = fr.getChildAt(0) as ImageView
+                loadFaceCrop(pf.first, pf.second, iv)
+                val s = position in sel
+                iv.alpha = if (s) 0.55f else 1f
+                fr.getChildAt(1).visibility = if (s) View.VISIBLE else View.GONE
+                return fr
+            }
+        }
+        grid.adapter = adapter
+        fun removeDoneFaces(idx: Collection<Int>) {
+            idx.sortedDescending().forEach { faces.removeAt(it) }
+            sel.clear()
+            refresh()
+            if (faces.isEmpty()) d.dismiss()
+        }
+        grid.setOnItemClickListener { _, _, pos, _ ->
+            if (sel.isNotEmpty()) {
+                if (!sel.remove(pos)) sel.add(pos)
+                refresh()
+            } else {
+                assignFaces(listOf(faces[pos].first)) { }
+                removeDoneFaces(listOf(pos))
+            }
+        }
+        grid.setOnItemLongClickListener { _, _, pos, _ ->
+            if (!sel.remove(pos)) sel.add(pos)
+            refresh()
+            true
+        }
+        who.setOnClickListener {
+            val idx = sel.toList()
+            assignFaces(idx.map { faces[it].first }) { }
+            removeDoneFaces(idx)
+        }
+        ign.setOnClickListener {
+            val idx = sel.toList()
+            idx.forEach { peopleState.ignore(faces[it].first) }
+            savePeopleState()
+            removeDoneFaces(idx)
+            regroupPeople()
+        }
+        d.setContentView(root)
+        d.show()
+        refresh()
+    }
+
+    // ---------------------------------------------------------------- Preguntas Sí / No
+
+    private fun startReview() {
+        val res = peopleResult ?: return
+        val byId = people.associateBy { it.id }
+        class Q(val merge: MergeSuggestion?, val sug: Suggestion?)
+        val queue = ArrayList<Q>()
+        res.merges.filter { byId[it.a] != null && byId[it.b] != null }.forEach { queue += Q(it, null) }
+        res.suggestions.filter { byId[it.groupId] != null && faceOf(it.face) != null }.forEach { queue += Q(null, it) }
+        if (queue.isEmpty()) { toast("No hay preguntas pendientes"); return }
+
+        val d = Dialog(
+            this,
+            if (dark) android.R.style.Theme_Material_NoActionBar_Fullscreen
+            else android.R.style.Theme_Material_Light_NoActionBar_Fullscreen
+        )
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(cBg)
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(20), dp(16), dp(20), dp(20))
+        }
+        root.setOnApplyWindowInsetsListener { v, insets ->
+            if (Build.VERSION.SDK_INT >= 30) {
+                val b = insets.getInsets(WindowInsets.Type.systemBars())
+                v.setPadding(dp(20), b.top + dp(16), dp(20), b.bottom + dp(20))
+            } else {
+                @Suppress("DEPRECATION")
+                v.setPadding(dp(20), insets.systemWindowInsetTop + dp(16), dp(20), insets.systemWindowInsetBottom + dp(20))
+            }
+            insets
+        }
+        val head = row()
+        val progressTv = tv("", 13f, cSub)
+        head.addView(progressTv, LinearLayout.LayoutParams(0, WRAP, 1f))
+        head.addView(tv("✕", 18f, cText).apply {
+            gravity = Gravity.CENTER
+            background = ripple(round(cCard, 22), 22)
+            setOnClickListener { d.dismiss() }
+        }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        root.addView(head, MATCH, WRAP)
+
+        val question = tv("", 24f, cText, bold = true).apply { gravity = Gravity.CENTER }
+        val hint = tv("", 13f, cSub).apply { gravity = Gravity.CENTER }
+        val side = (resources.displayMetrics.widthPixels - dp(20) * 2 - dp(16)) / 2
+        val pics = row().apply { gravity = Gravity.CENTER }
+        fun picBox(): Pair<LinearLayout, Pair<ImageView, TextView>> {
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+            val iv = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = round(cLine, 24)
+                clipToOutline = true
+            }
+            col.addView(iv, LinearLayout.LayoutParams(side, side))
+            val cap = tv("", 13f, cSub, medium = true).apply { gravity = Gravity.CENTER; maxLines = 1; ellipsize = TextUtils.TruncateAt.END }
+            col.addView(cap, LinearLayout.LayoutParams(side, WRAP).apply { topMargin = dp(8) })
+            return col to (iv to cap)
+        }
+        val (leftCol, left) = picBox()
+        val (rightCol, right) = picBox()
+        pics.addView(leftCol)
+        pics.addView(rightCol, lp(WRAP, WRAP).apply { leftMargin = dp(16) })
+
+        root.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+        root.addView(pics, lp(WRAP, WRAP))
+        root.addView(question, lp(MATCH, WRAP).apply { topMargin = dp(24) })
+        root.addView(hint, lp(MATCH, WRAP).apply { topMargin = dp(6) })
+        root.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
+        val btns = row()
+        val no = pillButton("✕  No", false, cRed) {}
+        val yes = pillButton("✓  Sí", true, cGreen) {}
+        btns.addView(no, LinearLayout.LayoutParams(0, WRAP, 1f))
+        btns.addView(yes, LinearLayout.LayoutParams(0, WRAP, 1f).apply { leftMargin = dp(12) })
+        root.addView(btns, MATCH, WRAP)
+        val skip = tv("No lo sé · saltar", 14f, cSub, medium = true).apply {
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(14), dp(12), dp(6))
+        }
+        root.addView(skip, MATCH, WRAP)
+
+        var i = 0
+        var answered = 0
+        val doneFaces = HashSet<FaceRef>()
+        val doneGroups = HashSet<String>()
+        fun current(): Q? {
+            while (i < queue.size) {
+                val q = queue[i]
+                val stale = (q.sug != null && (q.sug.face in doneFaces)) ||
+                    (q.merge != null && (q.merge.a in doneGroups || q.merge.b in doneGroups))
+                if (!stale) return q
+                i++
+            }
+            return null
+        }
+        fun show() {
+            val q = current()
+            if (q == null) { d.dismiss(); return }
+            progressTv.text = "Pregunta ${i + 1} de ${queue.size}"
+            if (q.merge != null) {
+                val a = byId[q.merge.a]!!
+                val b = byId[q.merge.b]!!
+                val (ap, af) = a.cover
+                val (bp, bf) = b.cover
+                loadFaceCrop(ap, af, left.first); left.second.text = "${displayName(a)} · ${a.photos.size}"
+                loadFaceCrop(bp, bf, right.first); right.second.text = "${displayName(b)} · ${b.photos.size}"
+                question.text = "¿Son la misma persona?"
+                hint.text = "Si dices que sí, se unen en una."
+            } else {
+                val s = q.sug!!
+                val (fp, ff) = faceOf(s.face)!!
+                val pr = byId[s.groupId]!!
+                val (cp, cf) = pr.cover
+                loadFaceCrop(fp, ff, left.first); left.second.text = "¿Esta cara…"
+                loadFaceCrop(cp, cf, right.first); right.second.text = "…es ${displayName(pr)}?"
+                question.text = "¿Es ${displayName(pr)}?"
+                hint.text = if (s.strong) "La segunda opinión cree que sí" else "Se parece, pero no estoy seguro"
+            }
+        }
+        fun answer(yesAnswer: Boolean?) {
+            val q = current() ?: return
+            if (yesAnswer != null) {
+                answered++
+                if (q.merge != null) {
+                    val a = byId[q.merge.a]!!
+                    val b = byId[q.merge.b]!!
+                    if (yesAnswer) {
+                        val target = ensureRecord(a)
+                        if (b.named) peopleState.merge(target, b.id) else b.refs.forEach { peopleState.confirm(it, target) }
+                        if (peopleState.persons[target]?.name.isNullOrBlank() && b.name.isNotBlank()) peopleState.rename(target, b.name)
+                        doneGroups += a.id; doneGroups += b.id
+                    } else {
+                        peopleState.markNotSame(a.id, b.id)
+                    }
+                } else {
+                    val s = q.sug!!
+                    if (yesAnswer) peopleState.confirm(s.face, s.groupId) else peopleState.reject(s.face, s.groupId)
+                    doneFaces += s.face
+                }
+                savePeopleState()
+            }
+            i++
+            show()
+        }
+        yes.setOnClickListener { answer(true) }
+        no.setOnClickListener { answer(false) }
+        skip.setOnClickListener { answer(null) }
+        d.setOnDismissListener { if (answered > 0) { toast("Gracias. Reagrupando…"); regroupPeople() } }
+        d.setContentView(root)
+        d.show()
+        show()
+    }
+
+    // ---------------------------------------------------------------- Segunda opinión
+
+    /** Caras sueltas y unas pocas caras de referencia por persona que aún no tienen segunda opinión. */
+    private fun secondOpinionTargets(): List<FaceRef> {
+        val res = peopleResult ?: return emptyList()
+        val out = ArrayList<FaceRef>()
+        out += res.loose.filter { it.v2 == null }
+        for (g in res.groups) {
+            val refs = g.faces.sortedWith(compareByDescending<FaceRef> { it.key in g.confirmed }.thenByDescending { it.area })
+            out += refs.take(6).filter { it.v2 == null }
+        }
+        return out
+    }
+
+    private fun startSecondOpinion() {
+        if (exploring) return
+        val targets = secondOpinionTargets()
+        if (targets.isEmpty()) return
+        exploring = true
+        exTitle = "Segunda opinión…"
+        analyzer.cancel = false
+        renderExplore()
+        val photos = photoById
+        Thread {
+            var n = 0
+            try {
+                ui { exSub?.text = "Preparando el modelo de alta precisión…" }
+                n = analyzer.secondOpinion(photos, targets) { done, total ->
+                    if (done % 3 == 0 || done == total) ui {
+                        exProgress?.progress = done * 1000 / max(1, total)
+                        exSub?.text = "Revisando cara $done de $total"
+                    }
+                }
+            } catch (_: Throwable) { }
+            ui {
+                exploring = false
+                exTitle = "Analizando…"
+                if (n < 0) toast("No se pudo cargar el modelo de alta precisión (¿poca memoria?)")
                 regroupPeople()
             }
-        })
-        c.addView(bar, lp(MATCH, WRAP).apply { topMargin = dp(8) })
-        val hints = row()
-        hints.addView(tv("Separar más", 12f, cSub), LinearLayout.LayoutParams(0, WRAP, 1f))
-        hints.addView(tv("Juntar más", 12f, cSub))
-        c.addView(hints)
-        c.addView(
-            tv("Si una persona sale partida en dos, junta más o ponles el mismo nombre. Si se mezclan personas, separa más o abre la persona, selecciona las fotos que sobran y pulsa «No es».", 12f, cSub).apply {
-                setLineSpacing(0f, 1.15f)
-            },
-            lp(MATCH, WRAP).apply { topMargin = dp(8) }
-        )
-        if (analyzer.lastStats.isNotEmpty()) {
-            c.addView(tv("Diagnóstico: ${analyzer.lastStats}", 11f, cSub), lp(MATCH, WRAP).apply { topMargin = dp(8) })
-        }
-        val n = excludedFaces().size
-        if (n > 0) {
-            c.addView(smallPill("Deshacer correcciones «No es» ($n)") {
-                getSharedPreferences("caras", MODE_PRIVATE).edit().remove("excluidas").apply()
-                regroupPeople()
-            }, lp(WRAP, WRAP).apply { topMargin = dp(10) })
-        }
-        return c
-    }
-
-
-    private fun excludedFaces(): Set<String> =
-        getSharedPreferences("caras", MODE_PRIVATE).getStringSet("excluidas", null)?.toSet() ?: emptySet()
-
-    private fun excludeFaces(keys: Collection<String>) {
-        val cur = excludedFaces().toMutableSet()
-        cur.addAll(keys)
-        getSharedPreferences("caras", MODE_PRIVATE).edit().putStringSet("excluidas", cur).apply()
-    }
-
-    private fun regroupPeople() {
-        val ps = explorePhotos
-        val nm = names()
-        Thread {
-            val pp = try { analyzer.people(ps, nm, settings.peopleSens, excludedFaces()) } catch (_: Throwable) { people }
-            ui { people = pp; renderExplore() }
         }.start()
     }
 
     private fun startAnalysis() {
         if (exploring) return
         exploring = true
+        exTitle = "Analizando…"
         analyzer.cancel = false
         renderExplore()
         val loc = hasLocPerm()
@@ -1569,10 +2045,14 @@ class MainActivity : Activity() {
                 val done = photos.filter { it.contentDone }
                 analyzer.cancel = false
                 ui { exProgress?.progress = 960; exSub?.text = "Agrupando caras por persona…" }
-                val pp = analyzer.people(done, names(), settings.peopleSens, excludedFaces())
+                val byId = done.associateBy { it.id }
+                val res = analyzer.people(analyzer.faceRefs(done), peopleState, settings.peopleSens)
+                val stats = analyzer.stats(done)
                 ui {
                     explorePhotos = done
-                    people = pp
+                    photoById = byId
+                    applyResult(res)
+                    faceStats = stats
                     analyzed = true
                 }
             } catch (e: Throwable) {
@@ -1785,20 +2265,32 @@ class MainActivity : Activity() {
                 }
                 .show()
         }
+        fun personRefs(pr: Person, ids: Set<Long>) = pr.refs.filter { it.photoId in ids }
         fun notThisPerson() {
             val pr = person ?: return
             val ids = selected().map { it.id }.toSet()
-            val keys = pr.keys.filterIndexed { i, _ -> pr.faces[i].first.id in ids }
-            excludeFaces(keys)
+            val refs = personRefs(pr, ids)
+            if (pr.named) refs.forEach { peopleState.reject(it, pr.id) } else refs.forEach { peopleState.ignore(it) }
+            savePeopleState()
             g.photos.removeAll { it.id in ids }
             g.delete.clear()
             refresh()
             regroupPeople()
             toast("Quitadas de esta persona (${ids.size})")
         }
+        fun isSomeoneElse() {
+            val pr = person ?: return
+            val ids = selected().map { it.id }.toSet()
+            val refs = personRefs(pr, ids)
+            if (pr.named) refs.forEach { peopleState.reject(it, pr.id) }
+            assignFaces(refs) { }
+            g.photos.removeAll { it.id in ids }
+            g.delete.clear()
+            refresh()
+        }
         moreBtn.setOnClickListener {
             val labels = mutableListOf("📍  Quitar ubicación", "🧽  Quitar datos personales")
-            if (person != null) labels += "🙅  No es esta persona"
+            if (person != null) { labels += "🙅  No es esta persona"; labels += "👤  Es otra persona…" }
             AlertDialog.Builder(this)
                 .setTitle("${g.delete.size} seleccionadas")
                 .setItems(labels.toTypedArray()) { _, which ->
@@ -1806,6 +2298,7 @@ class MainActivity : Activity() {
                         0 -> stripGps()
                         1 -> stripPersonal()
                         2 -> notThisPerson()
+                        3 -> isSomeoneElse()
                     }
                 }
                 .show()
@@ -2091,8 +2584,7 @@ class MainActivity : Activity() {
         val options = arrayOf(
             "Por fecha · una carpeta por mes",
             "Por fecha · una carpeta por año",
-            "Por persona · solo personas con nombre",
-            "Por categoría · comida, documentos, capturas…"
+            "Por persona · solo personas con nombre"
         )
         val rg = android.widget.RadioGroup(this)
         options.forEachIndexed { i, o ->
@@ -2129,12 +2621,12 @@ class MainActivity : Activity() {
             .setNegativeButton("Cancelar", null)
             .setPositiveButton("Ver qué se hará") { _, _ ->
                 val opt = rg.checkedRadioButtonId - 500
-                if (opt >= 2 && !analyzed) {
+                if (opt == 2 && !analyzed) {
                     toast("Primero analiza tus fotos en la pestaña Explorar")
                     selectPage(1)
                     return@setPositiveButton
                 }
-                if (opt == 2 && people.none { it.name.isNotBlank() }) {
+                if (opt == 2 && people.none { it.named && it.name.isNotBlank() }) {
                     toast("Pon nombre a alguna persona en Explorar → Personas")
                     selectPage(1)
                     return@setPositiveButton
@@ -2142,14 +2634,12 @@ class MainActivity : Activity() {
                 val skipWa = noWa.isChecked
                 val skipCam = noCam.isChecked
                 val pp = people
-                val ex = explorePhotos
                 Thread {
                     val all = if (galleryLoaded) allGallery else try { scanner.queryAll() } catch (_: Throwable) { emptyList() }
                     val plan = when (opt) {
                         0 -> organizer.planByDate(all, true)
                         1 -> organizer.planByDate(all, false)
-                        2 -> organizer.planByPerson(pp)
-                        else -> organizer.planByCategory(ex)
+                        else -> organizer.planByPerson(pp.filter { it.named })
                     }.filter { (p, t) ->
                         !(skipWa && (p.folder.contains("WhatsApp", true) || p.relPath.contains("WhatsApp", true))) &&
                             !(skipCam && p.isCamera) &&
@@ -2414,11 +2904,8 @@ class MainActivity : Activity() {
         allPhotos = allPhotos.filter { it.id !in ids }
         if (explorePhotos.any { it.id in ids }) {
             explorePhotos = explorePhotos.filter { it.id !in ids }
-            people = people.mapNotNull { pr ->
-                val f = pr.faces.filter { it.first.id !in ids }
-                if (f.map { it.first.id }.distinct().size >= ContentAnalyzer.MIN_FACES_PER_PERSON) Person(pr.keys, pr.name, f) else null
-            }
-            renderExplore()
+            photoById = explorePhotos.associateBy { it.id }
+            regroupPeople()
         }
         gridListener?.invoke(ids)
         groupAdapter.notifyDataSetChanged()

@@ -7,10 +7,6 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Base64
 import androidx.exifinterface.media.ExifInterface
-import com.google.android.gms.tasks.Tasks
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.label.ImageLabeling
-import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
 import java.io.File
 import kotlin.math.abs
 import kotlin.math.max
@@ -18,107 +14,35 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-class Category(val key: String, val title: String, val emoji: String, val test: (Photo) -> Boolean)
-
-class Person(val keys: List<String>, var name: String, val faces: List<Pair<Photo, FaceInfo>>) {
+/** Persona para mostrar: un grupo de PeopleEngine con sus fotos. */
+class Person(val id: String, var name: String, val named: Boolean, val faces: List<Pair<Photo, FaceInfo>>, val refs: List<FaceRef>) {
     val photos: List<Photo> get() = faces.map { it.first }.distinctBy { it.id }
     val cover: Pair<Photo, FaceInfo> get() = faces.maxBy { it.second.area }
 }
 
 /**
- * Reconocimiento de contenido 100 % en el móvil:
- *  - ML Kit (modelos incluidos en la APK) para etiquetas de objetos y detección de caras.
- *  - MobileFaceNet (TensorFlow Lite) para la huella de cada cara y agrupar por persona.
+ * Reconocimiento de caras 100 % en el móvil (InsightFace con ONNX Runtime):
+ *  - rápido: SCRFD + w600k_mbf para todas las caras,
+ *  - segunda opinión: w600k_r50 solo para las caras difíciles.
  */
 class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
 
     companion object {
-        private val DOCS = setOf(
-            "Receipt", "Paper", "Menu", "Newspaper", "News", "Passport", "Money", "Whiteboard",
-            "Blackboard", "Poster", "Presentation", "Comics"
-        )
-        private val FOOD = setOf(
-            "Food", "Fast food", "Cuisine", "Pizza", "Cake", "Bread", "Cookie", "Fruit", "Vegetable", "Sushi",
-            "Cheeseburger", "Hot dog", "Bento", "Couscous", "Pho", "Pie", "Gelato", "Icing", "Juice", "Coffee",
-            "Cappuccino", "Wine", "Alcohol", "Meal", "Lunch", "Supper", "Cola", "Pasteles", "Eating", "Tableware"
-        )
-        private val ANIMALS = setOf(
-            "Pet", "Dog", "Cat", "Bird", "Horse", "Insect", "Butterfly", "Duck", "Turtle", "Bear", "Cattle", "Herd",
-            "Penguin", "Seal", "Bull", "Crocodile", "Dalmatian", "Shetland sheepdog", "Cairn terrier", "Basset hound",
-            "Ragdoll", "Himalayan", "Sphynx", "Pixie-bob", "Cavalier", "Shikoku", "Gerbil", "Waterfowl", "Larva",
-            "Pomacentridae", "Dinosaur"
-        )
-        private val NATURE = setOf(
-            "Sky", "Sunset", "Beach", "Mountain", "Lake", "River", "Forest", "Waterfall", "Desert", "Dune", "Glacier",
-            "Iceberg", "Canyon", "Cliff", "Field", "Prairie", "Jungle", "Swamp", "Volcano", "Aurora", "Rainbow",
-            "Moon", "Nebula", "Flower", "Flora", "Plant", "Garden", "Sand", "Fog", "Storm", "Lightning", "Reef",
-            "Underwater", "Cave", "Petal", "Twig", "Branch"
-        )
-        private val CITY = setOf(
-            "Building", "Skyscraper", "Skyline", "Tower", "Bridge", "Church", "Cathedral", "Castle", "Palace",
-            "Monument", "Museum", "Temple", "Mosque", "Ruins", "Lighthouse", "Stadium", "Statue", "Ferris wheel"
-        )
-        private val VEHICLES = setOf(
-            "Car", "Vehicle", "Motorcycle", "Bicycle", "Bus", "Train", "Airplane", "Aircraft", "Airliner", "Boat",
-            "Sailboat", "Speedboat", "Van", "Tractor", "Helicopter", "Tire", "Wheel", "Odometer", "Windshield",
-            "Bumper", "Aviation"
-        )
-        private val EVENTS = setOf(
-            "Party", "Concert", "Event", "Christmas", "Carnival", "Fireworks", "Marriage", "Bride", "Groom",
-            "Graduation", "Prom", "Balloon", "Thanksgiving", "Hanukkah", "Dance", "Nightclub", "Sparkler",
-            "Santa claus", "Wreath", "Mortarboard"
-        )
-        private val SPORTS = setOf(
-            "Sports", "Soccer", "Running", "Marathon", "Cycling", "Swimming", "Skiing", "Surfing", "Rugby",
-            "Competition", "Gymnastics", "Racing", "Race", "Badminton", "Softball", "Snowboarding", "Skateboarder",
-            "Pitch", "Rowing", "Kayak", "Scuba diving"
-        )
-        private val KIDS = setOf("Baby", "Toy", "Stuffed toy", "Plush", "Playground", "Lego")
-
-        private fun has(p: Photo, set: Set<String>) = p.labels.any { it in set }
-
-        val CATEGORIES = listOf(
-            Category("people", "Con personas", "👥") { it.faces.isNotEmpty() },
-            Category("groups", "Grupos de gente", "👨‍👩‍👧") { it.faces.size >= 3 },
-            Category("selfies", "Selfies", "🤳") { "Selfie" in it.labels },
-            Category("nopeople", "Sin personas", "🖼️") { it.faces.isEmpty() },
-            Category("screens", "Capturas de pantalla", "📱") {
-                "Screenshot" in it.labels || "Web page" in it.labels ||
-                    it.folder.contains("Screenshot", true) || it.folder.contains("Captura", true)
-            },
-            Category("docs", "Documentos y papeles", "📄") { has(it, DOCS) },
-            Category("whatsapp", "WhatsApp", "💬") { it.folder.contains("WhatsApp", true) },
-            Category("food", "Comida y bebida", "🍽️") { has(it, FOOD) },
-            Category("animals", "Animales", "🐾") { has(it, ANIMALS) },
-            Category("nature", "Paisajes y naturaleza", "🏞️") { has(it, NATURE) },
-            Category("city", "Ciudad y monumentos", "🏛️") { has(it, CITY) },
-            Category("vehicles", "Vehículos", "🚗") { has(it, VEHICLES) },
-            Category("events", "Fiestas y celebraciones", "🎉") { has(it, EVENTS) },
-            Category("sports", "Deporte", "⚽") { has(it, SPORTS) },
-            Category("kids", "Bebés y juguetes", "🧸") { has(it, KIDS) }
-        )
-
-        const val FACE_VERSION = "5"           // sube cuando cambia el cálculo de huellas
+        const val FACE_VERSION = "6"           // sube cuando cambia el cálculo de huellas
         /** Similitud base para considerar dos caras la misma persona (medida con fotos etiquetadas). */
         const val BASE_THRESHOLD = 0.38f
         private const val MAX_PROFILE = 0.65f
         private const val MIN_EYES_PX = 12f      // distancia entre ojos mínima para fiarse de la huella
         const val MIN_FACES_PER_PERSON = 2
-        /** Etiquetas que indican que puede haber gente (para buscar también caras pequeñas). */
-        private val PEOPLE_HINT = setOf(
-            "Person", "Crowd", "Team", "Selfie", "Smile", "Laugh", "Party", "Event", "Concert", "Dance",
-            "Marriage", "Bride", "Groom", "Graduation", "Prom", "Sports", "Fun", "Leisure", "Vacation",
-            "Community", "Crew", "Class", "Competition", "Baby", "Beard", "Hair", "Dude", "Interaction",
-            "Sitting", "Standing", "Eating", "Musician", "Singer", "Swimming", "Running", "Picnic", "Bathing",
-            "Grandparent", "Love", "Eyelash", "Mouth", "Ear", "Hand", "Tattoo", "Muscle", "Skin"
-        )
+        /** Motivos por los que una cara no se usa para comparar. */
+        const val WHY_OK = 0
+        const val WHY_PROFILE = 1
+        const val WHY_SMALL = 2
+        const val WHY_FAIL = 3
     }
 
     @Volatile var cancel = false
 
-    private val labeler by lazy {
-        ImageLabeling.getClient(ImageLabelerOptions.Builder().setConfidenceThreshold(0.6f).build())
-    }
     private val engine = FaceEngine(ctx)
     val hasFaceModel: Boolean get() = engine.ready
     private var dim = 512
@@ -132,11 +56,6 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         try {
             val bmp = scanner.decodeUpright(p.uri, 1024)
             if (bmp == null) { p.contentDone = true; return }
-            val img = InputImage.fromBitmap(bmp, 0)
-            p.labels = Tasks.await(labeler.process(img))
-                .sortedByDescending { it.confidence }
-                .take(8)
-                .map { it.text }
             p.faces = detectFaces(p, bmp)
             applyXmpNames(p)
             bmp.recycle()
@@ -177,9 +96,10 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         try {
             // Caras pequeñas (fotos de grupo, gente al fondo): segunda pasada por trozos
             val all = ArrayList<Det>(first)
-            val maybePeople = first.isNotEmpty() || p.labels.any { it in PEOPLE_HINT }
             val side = max(p.w, p.h)
-            if (maybePeople && (side == 0 || side >= 1200)) {
+            val screenshot = p.folder.contains("Screenshot", true) || p.folder.contains("Captura", true) ||
+                p.name.endsWith(".png", true)
+            if (!screenshot && (side == 0 || side >= 1200)) {
                 val b = ensureBig()
                 if (b != null) {
                     for (d in engine.detectTiles(b)) {
@@ -195,7 +115,9 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                 val b = (d.y2 / bmp.height).coerceIn(0f, 1f)
                 if (r - l <= 0f || b - t <= 0f) continue
                 var emb: ByteArray? = null
+                var why = WHY_FAIL
                 val eyes = engine.eyeDistance(d)
+                if (engine.profile(d) > MAX_PROFILE) why = WHY_PROFILE
                 if (engine.ready && engine.profile(d) <= MAX_PROFILE) {
                     var src = bmp
                     var k = d.kps
@@ -207,12 +129,17 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                         }
                     }
                     val effEyes = eyes * src.width / bmp.width
-                    if (effEyes >= MIN_EYES_PX) engine.embed(src, k)?.let { v ->
+                    if (effEyes < MIN_EYES_PX) why = WHY_SMALL
+                    else engine.embed(src, k)?.let { v ->
                         dim = v.size
                         emb = quantize(v)
+                        why = WHY_OK
                     }
                 }
-                list += FaceInfo(l, t, r, b, emb)
+                list += FaceInfo(l, t, r, b, emb).apply {
+                    kps = FloatArray(10) { (if (it % 2 == 0) d.kps[it] / bmp.width else d.kps[it] / bmp.height) }
+                    this.why = why
+                }
             }
         } finally {
             big?.recycle()
@@ -324,121 +251,114 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
         return sorted[((sorted.size - 1) * q).toInt().coerceIn(0, sorted.size - 1)]
     }
 
-    /**
-     * Agrupa caras por persona.
-     *  1) Calibra el umbral con caras de la MISMA foto (son por fuerza personas distintas):
-     *     el umbral queda justo por encima de lo que se parecen dos desconocidos en estas fotos.
-     *  2) Une dos caras solo si cada una está entre las K más parecidas de la otra (vecinos mutuos)
-     *     y nunca si salen en la misma foto. Así no se forman cadenas que mezclen gente.
-     *  3) Chinese Whispers sobre ese grafo para formar los grupos.
-     * sens: 0..30, 15 = automático; más alto junta más.
-     */
-    fun people(photos: List<Photo>, names: Map<String, String>, sens: Int, excluded: Set<String>): List<Person> {
-        val faces = ArrayList<F>()
+    /** Caras con huella → referencias para PeopleEngine (con la segunda opinión si ya se calculó). */
+    fun faceRefs(photos: List<Photo>): List<FaceRef> {
+        val v2 = loadV2()
+        val out = ArrayList<FaceRef>()
         for (p in photos) p.faces.forEachIndexed { i, f ->
-            val e = f.emb
-            val key = "${p.id}:$i"
-            if (e != null && (dim == 0 || e.size == dim) && key !in excluded) faces += F(p, f, key, deq(e))
+            val e = f.emb ?: return@forEachIndexed
+            if (dim != 0 && e.size != dim) return@forEachIndexed
+            val cx = (f.l + f.r) / 2f
+            val cy = (f.t + f.b) / 2f
+            val r = FaceRef(p.id, i, cx, cy, f.area, deq(e), null, f.name)
+            r.v2 = v2[p.id]?.firstOrNull { abs(it.cx - cx) < 0.03f && abs(it.cy - cy) < 0.03f }?.v
+            out += r
         }
-        if (faces.isEmpty()) { lastStats = "Sin caras válidas"; return emptyList() }
-        val size = faces[0].v.size
-        faces.removeAll { it.v.size != size }
-        val n = faces.size
+        return out
+    }
 
-        // 1) Calibración
-        val same = ArrayList<Float>()
-        faces.indices.groupBy { faces[it].p.id }.values.forEach { idx ->
-            if (idx.size >= 2) for (a in idx.indices) for (b in a + 1 until idx.size) {
-                same += dot(faces[idx[a]].v, faces[idx[b]].v)
-            }
-        }
-        // Base medida con fotos etiquetadas; si en tus fotos los desconocidos se parecen más, se sube
-        val floor = if (same.size >= 15) percentile(same, 0.99) + 0.06f else 0f
-        val auto = max(BASE_THRESHOLD, floor).coerceIn(0.25f, 0.80f)
-        val t = (auto + (15 - sens.coerceIn(0, 30)) * 0.01f).coerceIn(0.15f, 0.90f)
+    fun people(refs: List<FaceRef>, state: PeopleState, sens: Int): PeopleResult {
+        val t = PeopleEngine.threshold(refs, BASE_THRESHOLD, sens)
+        val r = PeopleEngine.run(refs, state, t) { cancel }
+        lastStats = r.stats
+        return r
+    }
 
-        // 2) K vecinos más parecidos por encima del umbral
-        val k = 12
-        val nb = Array(n) { IntArray(k) { -1 } }
-        val ns = Array(n) { FloatArray(k) { -2f } }
-        fun offer(i: Int, j: Int, sim: Float) {
-            val a = ns[i]
-            var mi = 0
-            for (q in 1 until k) if (a[q] < a[mi]) mi = q
-            if (sim > a[mi]) { a[mi] = sim; nb[i][mi] = j }
-        }
-        for (i in 0 until n) {
-            if (cancel) return emptyList()
-            val vi = faces[i].v
-            val pi = faces[i].p.id
-            for (j in i + 1 until n) {
-                if (faces[j].p.id == pi) continue
-                val sim = dot(vi, faces[j].v)
-                if (sim > t) { offer(i, j, sim); offer(j, i, sim) }
-            }
-        }
-        val adj = Array(n) { ArrayList<Int>() }
-        val adjW = Array(n) { ArrayList<Float>() }
-        var edges = 0
-        for (i in 0 until n) for (q in 0 until k) {
-            val j = nb[i][q]
-            if (j > i && nb[j].contains(i)) {
-                adj[i] += j; adjW[i] += ns[i][q]
-                adj[j] += i; adjW[j] += ns[i][q]
-                edges++
-            }
-        }
+    class FaceStats(
+        val photos: Int, val withFaces: Int, val faces: Int, val usable: Int,
+        val profile: Int, val small: Int, val failed: Int, val second: Int
+    )
 
-        // 3) Chinese Whispers
-        val label = IntArray(n) { it }
-        val order = (0 until n).toMutableList()
-        val rnd = java.util.Random(7)
-        repeat(20) {
-            order.shuffle(rnd)
-            var changed = 0
-            for (i in order) {
-                if (adj[i].isEmpty()) continue
-                val w = HashMap<Int, Float>()
-                for (q in adj[i].indices) {
-                    val l = label[adj[i][q]]
-                    w[l] = (w[l] ?: 0f) + adjW[i][q]
+    fun stats(photos: List<Photo>): FaceStats {
+        var withFaces = 0; var total = 0; var ok = 0; var prof = 0; var small = 0; var fail = 0
+        for (p in photos) {
+            if (p.faces.isNotEmpty()) withFaces++
+            for (f in p.faces) {
+                total++
+                when {
+                    f.emb != null -> ok++
+                    f.why == WHY_PROFILE -> prof++
+                    f.why == WHY_SMALL -> small++
+                    else -> fail++
                 }
-                val best = w.maxBy { it.value }.key
-                if (best != label[i]) { label[i] = best; changed++ }
             }
-            if (changed == 0) return@repeat
         }
+        val second = loadV2().values.sumOf { it.size }
+        return FaceStats(photos.size, withFaces, total, ok, prof, small, fail, second)
+    }
 
-        // Limpieza: fuera las caras que se parecen poco al conjunto de su grupo
-        val groups = (0 until n).groupBy { label[it] }.values.map { idx ->
-            if (idx.size < 3) idx else {
-                val c = FloatArray(size)
-                for (i in idx) for (q in 0 until size) c[q] += faces[i].v[q]
-                normalize(c)
-                idx.filter { dot(c, faces[it].v) >= t }
+    // ------------------------------------------------------------ Segunda opinión (modelo grande)
+
+    class V2(val cx: Float, val cy: Float, val v: FloatArray)
+
+    private var v2Cache: HashMap<Long, MutableList<V2>>? = null
+    private fun v2File() = File(ctx.filesDir, "faces_r50.txt")
+
+    val hasLargeModel: Boolean get() = engine.hasLarge()
+
+    @Synchronized
+    fun loadV2(): Map<Long, List<V2>> {
+        v2Cache?.let { return it }
+        val m = HashMap<Long, MutableList<V2>>()
+        try {
+            if (v2File().exists()) v2File().forEachLine { line ->
+                val q = line.split(';')
+                if (q.size == 4) {
+                    val id = q[0].toLongOrNull() ?: return@forEachLine
+                    val e = try { Base64.decode(q[3], Base64.NO_WRAP) } catch (_: Exception) { return@forEachLine }
+                    m.getOrPut(id) { ArrayList() } += V2(q[1].toFloat(), q[2].toFloat(), deq(e))
+                }
             }
-        }.filter { idx -> idx.map { faces[it].p.id }.distinct().size >= MIN_FACES_PER_PERSON }
-        lastStats = String.format(
-            java.util.Locale.getDefault(),
-            "%d caras · umbral %.2f (automático %.2f con %d parejas) · %d enlaces",
-            n, t, auto, same.size, edges
-        )
+        } catch (_: Exception) { }
+        v2Cache = m
+        return m
+    }
 
-        val raw = groups.map { idx ->
-            val m = idx.map { faces[it] }.sortedByDescending { it.f.area }
-            val keys = m.map { it.key }
-            // Nombre: el que pusiste en la app; si no, el más repetido en las caras etiquetadas del archivo
-            val name = keys.firstNotNullOfOrNull { names[it] }
-                ?: m.mapNotNull { it.f.name }.groupingBy { it }.eachCount().maxByOrNull { it.value }?.key
-                ?: ""
-            Person(keys, name, m.map { it.p to it.f })
+    @Synchronized
+    private fun addV2(photoId: Long, cx: Float, cy: Float, v: FloatArray) {
+        val q = quantize(v) ?: return
+        loadV2()
+        v2Cache!!.getOrPut(photoId) { ArrayList() } += V2(cx, cy, deq(q))
+        try { v2File().appendText("$photoId;$cx;$cy;${Base64.encodeToString(q, Base64.NO_WRAP)}\n") } catch (_: Exception) { }
+    }
+
+    /** Calcula la huella del modelo grande para las caras indicadas. Devuelve cuántas ha hecho. */
+    fun secondOpinion(photos: Map<Long, Photo>, targets: List<FaceRef>, progress: (Int, Int) -> Unit): Int {
+        engine.loadLarge()
+        if (!engine.largeReady) return -1
+        val todo = targets.filter { it.v2 == null }
+        val byPhoto = todo.groupBy { it.photoId }
+        var done = 0
+        for ((pid, fs) in byPhoto) {
+            if (cancel) break
+            val p = photos[pid] ?: continue
+            val bmp = scanner.decodeUpright(p.uri, 2304) ?: continue
+            try {
+                for (r in fs) {
+                    val k = p.faces.getOrNull(r.index)?.kps ?: continue
+                    val kk = FloatArray(10) { if (it % 2 == 0) k[it] * bmp.width else k[it] * bmp.height }
+                    engine.embedLarge(bmp, kk)?.let { v ->
+                        r.v2 = v
+                        addV2(pid, r.cx, r.cy, v)
+                    }
+                    done++
+                    progress(done, todo.size)
+                }
+            } finally {
+                bmp.recycle()
+            }
         }
-        // Personas con el mismo nombre se unen (así se pueden fusionar renombrando)
-        val named = raw.filter { it.name.isNotBlank() }.groupBy { it.name.trim().lowercase() }.values.map { sameName ->
-            if (sameName.size == 1) sameName[0]
-            else Person(sameName.flatMap { it.keys }, sameName[0].name, sameName.flatMap { it.faces })
-        }
-        return (named + raw.filter { it.name.isBlank() }).sortedByDescending { it.photos.size }
+        return done
     }
 
     // ------------------------------------------------------------ Caché
@@ -473,6 +393,8 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                     if (q.size > 4 && q[4].isNotEmpty()) Base64.decode(q[4], Base64.NO_WRAP) else null
                 ).apply {
                     if (q.size > 5 && q[5].isNotEmpty()) name = String(Base64.decode(q[5], Base64.NO_WRAP), Charsets.UTF_8)
+                    if (q.size > 6 && q[6].isNotEmpty()) kps = q[6].split(':').map { it.toFloat() }.toFloatArray().takeIf { it.size == 10 }
+                    if (q.size > 7) why = q[7].toIntOrNull() ?: 0
                 }
             }
             p.xmpChecked = s.size >= 7 && s[6] == "1"
@@ -493,7 +415,8 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                     val faces = p.faces.joinToString("|") { f ->
                         val e = f.emb?.let { Base64.encodeToString(it, Base64.NO_WRAP) } ?: ""
                         val nm = f.name?.let { Base64.encodeToString(it.toByteArray(Charsets.UTF_8), Base64.NO_WRAP) } ?: ""
-                        "${f.l},${f.t},${f.r},${f.b},$e,$nm"
+                        val k = f.kps?.joinToString(":") ?: ""
+                        "${f.l},${f.t},${f.r},${f.b},$e,$nm,$k,${f.why}"
                     }
                     val gps = if (!p.gpsChecked) "?" else if (p.hasGps) "1" else "0"
                     w.write("${p.id};${p.modified};$gps;$model;${p.labels.joinToString(",")};$faces;${if (p.xmpChecked) 1 else 0}\n")

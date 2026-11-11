@@ -29,6 +29,8 @@ class FaceEngine(private val ctx: Context) {
     companion object {
         const val DET_FILE = "det_500m.onnx"
         const val REC_FILE = "w600k_mbf.onnx"
+        /** Modelo grande (segunda opinión): más preciso con fotos difíciles, ~16 veces más lento. */
+        const val REC_LARGE_FILE = "w600k_r50.onnx"
         private const val DET = 640
         private const val REC = 112
         private const val DET_THRESHOLD = 0.5f
@@ -44,6 +46,40 @@ class FaceEngine(private val ctx: Context) {
     private var rec: OrtSession? = null
     private var detIn = ""
     private var recIn = ""
+    private var recLarge: OrtSession? = null
+    private var recLargeIn = ""
+    val largeReady: Boolean get() = recLarge != null
+
+    fun hasLarge(): Boolean = try { ctx.assets.list("")?.contains(REC_LARGE_FILE) == true } catch (_: Exception) { false }
+
+    /**
+     * Carga el modelo grande desde un archivo (no desde memoria: pesa 174 MB).
+     * La primera vez se copia de la APK a la carpeta privada de la app.
+     */
+    @Synchronized
+    fun loadLarge() {
+        if (recLarge != null || !hasLarge()) return
+        try {
+            val e = env ?: OrtEnvironment.getEnvironment().also { env = it }
+            val f = java.io.File(ctx.filesDir, REC_LARGE_FILE)
+            val tmp = java.io.File(ctx.filesDir, "$REC_LARGE_FILE.tmp")
+            if (!f.exists()) {
+                ctx.assets.open(REC_LARGE_FILE).use { ins -> tmp.outputStream().use { ins.copyTo(it, 1 shl 16) } }
+                tmp.renameTo(f)
+            }
+            val opts = OrtSession.SessionOptions()
+            // XNNPACK acelera las convoluciones en el móvil; si esta versión no lo trae, se sigue sin él
+            val xnn = try {
+                opts.javaClass.getMethod("addXnnpack", Map::class.java)
+                    .invoke(opts, mapOf("intra_op_num_threads" to "4"))
+                true
+            } catch (_: Throwable) { false }
+            opts.setIntraOpNumThreads(if (xnn) 1 else 4)
+            recLarge = e.createSession(f.absolutePath, opts).also { recLargeIn = it.inputNames.first() }
+        } catch (_: Throwable) {
+            recLarge = null
+        }
+    }
     val ready: Boolean get() = det != null && rec != null
     val canDetect: Boolean get() = det != null
 
@@ -209,8 +245,9 @@ class FaceEngine(private val ctx: Context) {
         return Matrix().apply { setValues(floatArrayOf(ca, -cb, tx, cb, ca, ty, 0f, 0f, 1f)) }
     }
 
-    private fun run(px: IntArray): FloatArray? {
-        val s = rec ?: return null
+    private fun run(px: IntArray, large: Boolean = false): FloatArray? {
+        val s = (if (large) recLarge else rec) ?: return null
+        val inputName = if (large) recLargeIn else recIn
         val e = env ?: return null
         val plane = REC * REC
         val data = FloatArray(3 * plane)
@@ -221,7 +258,7 @@ class FaceEngine(private val ctx: Context) {
             data[2 * plane + i] = ((c and 0xFF) - 127.5f) / 127.5f
         }
         OnnxTensor.createTensor(e, FloatBuffer.wrap(data), longArrayOf(1, 3, REC.toLong(), REC.toLong())).use { input ->
-            s.run(mapOf(recIn to input)).use { out ->
+            s.run(mapOf(inputName to input)).use { out ->
                 val fb = (out.get(0) as OnnxTensor).floatBuffer
                 val v = FloatArray(fb.remaining())
                 fb.get(v)
@@ -235,8 +272,11 @@ class FaceEngine(private val ctx: Context) {
      * Se suma la huella de la cara en espejo (más estable).
      */
     @Synchronized
-    fun embed(src: Bitmap, kps: FloatArray): FloatArray? {
-        if (rec == null) return null
+    fun embedLarge(src: Bitmap, kps: FloatArray): FloatArray? = embed(src, kps, true)
+
+    @Synchronized
+    fun embed(src: Bitmap, kps: FloatArray, large: Boolean = false): FloatArray? {
+        if ((if (large) recLarge else rec) == null) return null
         return try {
             val m = similarity(kps, TEMPLATE) ?: return null
             val face = Bitmap.createBitmap(REC, REC, Bitmap.Config.ARGB_8888)
@@ -246,8 +286,8 @@ class FaceEngine(private val ctx: Context) {
             face.recycle()
             val mirror = IntArray(px.size)
             for (y in 0 until REC) for (x in 0 until REC) mirror[y * REC + x] = px[y * REC + (REC - 1 - x)]
-            val a = run(px) ?: return null
-            val b = run(mirror) ?: return null
+            val a = run(px, large) ?: return null
+            val b = run(mirror, large) ?: return null
             val v = FloatArray(a.size) { a[it] + b[it] }
             var n = 0.0
             for (x in v) n += x * x

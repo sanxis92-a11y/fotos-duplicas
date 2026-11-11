@@ -38,6 +38,10 @@ class Photo(
 class FaceInfo(val l: Float, val t: Float, val r: Float, val b: Float, val emb: ByteArray?) {
     /** Nombre guardado en el propio archivo (caras etiquetadas por otro programa). */
     var name: String? = null
+    /** 5 puntos (ojos, nariz, boca) normalizados 0..1 sobre la foto enderezada. */
+    var kps: FloatArray? = null
+    /** 0 = válida; 1 = de perfil; 2 = pequeña; 3 = fallo. */
+    var why: Int = 0
     val area: Float get() = (r - l) * (b - t)
 }
 
