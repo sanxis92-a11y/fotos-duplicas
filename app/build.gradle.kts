@@ -11,8 +11,8 @@ android {
         applicationId = "com.sanxis.fotosduplicadas"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.5"
+        versionCode = 7
+        versionName = "1.6"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
@@ -30,7 +30,7 @@ android {
 dependencies {
     // Modelos incluidos en la APK: funcionan sin conexión
     implementation("com.google.mlkit:image-labeling:17.0.9")
-    implementation("com.google.mlkit:face-detection:16.1.7")
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    // Caras: modelos InsightFace (buffalo_s) con ONNX Runtime
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

@@ -19,7 +19,7 @@ APK Android (8.0 o superior) que encuentra fotos repetidas o casi iguales y cons
 - Modo claro y oscuro.
 
 ## Explorar (v1.2)
-- **Personas:** detecta caras y las agrupa por persona (MobileFaceNet). Se les puede poner nombre; dos con el mismo nombre se unen.
+- **Personas:** detecta caras y las agrupa por persona (InsightFace buffalo_s: SCRFD + w600k_mbf con ONNX Runtime; modelos de uso no comercial). Se les puede poner nombre; dos con el mismo nombre se unen.
 - **Con / sin personas, grupos y selfies.**
 - **Categorías:** capturas, documentos y recibos, WhatsApp, comida, animales, paisajes, ciudad, vehículos, fiestas, deporte, bebés y juguetes (ML Kit, modelo incluido en la APK).
 - **Privacidad:** lista de fotos con ubicación GPS y borrado de la ubicación o de todos los datos personales, por lotes.
