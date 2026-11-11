@@ -14,6 +14,7 @@ class Photo(
     /** dHash horizontal+vertical: [0,1] original, [2,3] 90°, [4,5] 180°, [6,7] 270°, [8,9] espejo. */
     val hashes = LongArray(10)
     var lum = 0
+    var grid: ByteArray? = null   // rejilla 16×16 para «misma escena»
     var blur = -1.0      // varianza del Laplaciano a escala reducida (-1 = sin calcular)
     var contrast = 0.0   // desviación típica del gris (para no tomar fotos lisas por borrosas)
     var sharp = -1.0     // nitidez a ~1-2 MP, solo para fotos que están en un grupo
@@ -92,6 +93,10 @@ class Settings(ctx: Context) {
     var rotated: Boolean
         get() = sp.getBoolean("rotated", false)
         set(v) { sp.edit().putBoolean("rotated", v).apply() }
+    /** Agrupar fotos con el mismo fondo aunque la persona se mueva. */
+    var scene: Boolean
+        get() = sp.getBoolean("scene", true)
+        set(v) { sp.edit().putBoolean("scene", v).apply() }
     var timeWindow: Int
         get() = sp.getInt("timeWindow", 0).coerceIn(0, WINDOWS.size - 1)
         set(v) { sp.edit().putInt("timeWindow", v).apply() }

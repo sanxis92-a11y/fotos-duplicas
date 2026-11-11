@@ -98,12 +98,20 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
             Category("kids", "Bebés y juguetes", "🧸") { has(it, KIDS) }
         )
 
-        const val FACE_VERSION = "4"           // sube cuando cambia el cálculo de huellas
+        const val FACE_VERSION = "5"           // sube cuando cambia el cálculo de huellas
         /** Similitud base para considerar dos caras la misma persona (medida con fotos etiquetadas). */
         const val BASE_THRESHOLD = 0.38f
-        private const val MAX_PROFILE = 0.55f
-        private const val MIN_EYES_PX = 14f      // distancia entre ojos mínima para fiarse de la huella
-        const val MIN_FACES_PER_PERSON = 3
+        private const val MAX_PROFILE = 0.65f
+        private const val MIN_EYES_PX = 12f      // distancia entre ojos mínima para fiarse de la huella
+        const val MIN_FACES_PER_PERSON = 2
+        /** Etiquetas que indican que puede haber gente (para buscar también caras pequeñas). */
+        private val PEOPLE_HINT = setOf(
+            "Person", "Crowd", "Team", "Selfie", "Smile", "Laugh", "Party", "Event", "Concert", "Dance",
+            "Marriage", "Bride", "Groom", "Graduation", "Prom", "Sports", "Fun", "Leisure", "Vacation",
+            "Community", "Crew", "Class", "Competition", "Baby", "Beard", "Hair", "Dude", "Interaction",
+            "Sitting", "Standing", "Eating", "Musician", "Singer", "Swimming", "Running", "Picnic", "Bathing",
+            "Grandparent", "Love", "Eyelash", "Mouth", "Ear", "Hand", "Tattoo", "Muscle", "Skin"
+        )
     }
 
     @Volatile var cancel = false
@@ -150,11 +158,34 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
 
     private fun detectFaces(p: Photo, bmp: Bitmap): List<FaceInfo> {
         if (!engine.canDetect) return emptyList()
-        val found = engine.detect(bmp)
-        if (found.isEmpty()) return emptyList()
-        var big: Bitmap? = null   // la misma foto a más resolución, para caras pequeñas
+        val first = engine.detect(bmp)
+        var big: Bitmap? = null   // la misma foto a más resolución (~2000 px)
+        var bs = 1f
+        fun ensureBig(): Bitmap? {
+            if (big == null) {
+                val b = scanner.decodeUpright(p.uri, 2304)
+                if (b != null && b.width > bmp.width) {
+                    big = b
+                    bs = b.width.toFloat() / bmp.width
+                } else b?.recycle()
+            }
+            return big
+        }
         val list = ArrayList<FaceInfo>()
         try {
+            // Caras pequeñas (fotos de grupo, gente al fondo): segunda pasada por trozos
+            val all = ArrayList<Det>(first)
+            val maybePeople = first.isNotEmpty() || p.labels.any { it in PEOPLE_HINT }
+            val side = max(p.w, p.h)
+            if (maybePeople && (side == 0 || side >= 1200)) {
+                val b = ensureBig()
+                if (b != null) {
+                    for (d in engine.detectTiles(b)) {
+                        all += Det(d.x1 / bs, d.y1 / bs, d.x2 / bs, d.y2 / bs, d.score, FloatArray(10) { d.kps[it] / bs })
+                    }
+                }
+            }
+            val found = if (all.size == first.size) first else engine.nms(all)
             for (d in found) {
                 val l = (d.x1 / bmp.width).coerceIn(0f, 1f)
                 val t = (d.y1 / bmp.height).coerceIn(0f, 1f)
@@ -167,12 +198,10 @@ class ContentAnalyzer(private val ctx: Context, private val scanner: Scanner) {
                     var src = bmp
                     var k = d.kps
                     if (eyes < 40f) {
-                        if (big == null) big = scanner.decodeUpright(p.uri, 2304)
-                        val bg = big
-                        if (bg != null && bg.width > bmp.width) {
-                            val sc = bg.width.toFloat() / bmp.width
+                        val bg = ensureBig()
+                        if (bg != null) {
                             src = bg
-                            k = FloatArray(10) { d.kps[it] * sc }
+                            k = FloatArray(10) { d.kps[it] * bs }
                         }
                     }
                     val effEyes = eyes * src.width / bmp.width

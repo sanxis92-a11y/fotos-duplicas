@@ -1092,6 +1092,7 @@ class MainActivity : Activity() {
         section("Qué cuenta como repetida")
         val winSp = spinner(Settings.WINDOW_LABELS, settings.timeWindow)
         val rotCb = check("Detectar también fotos giradas o volteadas", settings.rotated)
+        val sceneCb = check("Agrupar fotos de la misma escena (mismo fondo, la persona se mueve)", settings.scene)
 
         section("Qué foto conservar")
         val keepSp = spinner(Settings.KEEP_LABELS, settings.keepRule)
@@ -1121,7 +1122,8 @@ class MainActivity : Activity() {
                 val newMin = Settings.MIN_KB[minSp.selectedItemPosition.coerceIn(0, Settings.MIN_KB.size - 1)]
                 val rescan = scopeSp.selectedItemPosition != settings.scope || chosen != settings.folders ||
                     excl != settings.excluded || newMin != settings.minKb || (blurCb.isChecked && !settings.blurry)
-                val regroup = winSp.selectedItemPosition != settings.timeWindow || rotCb.isChecked != settings.rotated
+                val regroup = winSp.selectedItemPosition != settings.timeWindow || rotCb.isChecked != settings.rotated ||
+                    sceneCb.isChecked != settings.scene
                 val remark = keepSp.selectedItemPosition != settings.keepRule || camCb.isChecked != settings.preferCamera
 
                 settings.scope = scopeSp.selectedItemPosition
@@ -1130,6 +1132,7 @@ class MainActivity : Activity() {
                 settings.minKb = newMin
                 settings.timeWindow = winSp.selectedItemPosition
                 settings.rotated = rotCb.isChecked
+                settings.scene = sceneCb.isChecked
                 settings.keepRule = keepSp.selectedItemPosition
                 settings.preferCamera = camCb.isChecked
                 settings.blurry = blurCb.isChecked
